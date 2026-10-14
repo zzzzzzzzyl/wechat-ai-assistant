@@ -633,7 +633,7 @@ class ReadWindow(ShellDialog):
         head = QtWidgets.QLabel(
             "下面是程序这一次从微信窗口里读到的对话，按时间从上到下排。"
             "「→」那几条是它准备用来生成建议的目标。"
-            "**没有调用 AI、也没有花 token。**")
+            "看一眼不会调用 AI，也不产生费用。")
         head.setFont(style.font("label"))
         head.setWordWrap(True)
         head.setStyleSheet("color:%s; background:transparent;"

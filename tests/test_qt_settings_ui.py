@@ -2147,6 +2147,73 @@ def test_auto_apply(app, tmp):
         pump(app, 200)
         check("同组重建（恢复默认/放弃改动那条路）也不跳顶",
               _bar.value() >= _pos - 40, "重建后 %d" % _bar.value())
+
+        # ---- 19i. ⚠️⚠️ 重建会把视图**推到下面去**（用户报「改 AI 接口后保存跳到下面去」）
+        #
+        #    2026-10-15 用户：「为什么修改 ai 接口后，保存会跳到下面去」。
+        #    根因：`_restore_scroll()` 开头对 **`pos <= 0` 早退** —— 而重建
+        #    **自己**就会把视图从 0 推到接近底部（实测 0 → 860/883），
+        #    所以"用户停在顶部"这种最常见的情形从来没被恢复过。
+        #    ⚠️ 上面 ③ 量的是**中间**位置（120 / max//2）—— 正因为如此漏掉了这个 bug：
+        #       **判据必须覆盖边界值（0 / max），不能只量中间。**
+        #    ⚠️⚠️ **触发条件是「焦点在某个输入框里」**（实测：焦点在滚动区上时重建
+        #       0 → 0 不动；焦点在 `EntryBox` 里时 0 → 860）。用户刚打完字，
+        #       焦点当然在框里 —— 所以判据**必须先 `setFocus()`**，否则测不到东西。
+        print("\n19i. 焦点在输入框里时重建不许把视图推到下面 + 焦点要回到原来那一项")
+        _fkey = None
+        for _k, _f in win._fields.items():
+            if hasattr(_f, "box") and hasattr(_f.box, "setFocus"):
+                _fkey = _k
+                break
+        check("这一组里有带输入框的项（否则下面两条没意义）",
+              _fkey is not None, repr(_fkey))
+
+        if _fkey is not None:
+            win._fields[_fkey].box.setFocus()
+            pump(app, 120)
+            _bar.setValue(0)
+            pump(app, 150)
+            check("打字时焦点就在 %s 上（触发条件）" % SPEC_BY_KEY[_fkey].label,
+                  win._focus_key() == _fkey, repr(win._focus_key()))
+            win._rebuild_keep_scroll()
+            pump(app, 350)
+            check("重建后**还在顶部**（没被推到下面）",
+                  _bar.value() <= 8,
+                  "重建后 %d（max=%d）" % (_bar.value(), _bar.maximum()))
+
+            # ⚠️ **反例自检**：把恢复逻辑换回老写法（`pos <= 0` 早退）+ 焦点在框里，
+            #    上一条必须能红 —— 否则它可能只是"碰巧没动"，等于没验。
+            _real_restore = win._restore_scroll
+
+            def _legacy_restore(pos):
+                if pos <= 0:                   # ← 老写法，就是这么漏的
+                    return
+                return _real_restore(pos)
+
+            win._restore_scroll = _legacy_restore
+            try:
+                win._fields[_fkey].box.setFocus()
+                pump(app, 120)
+                _bar.setValue(0)
+                pump(app, 150)
+                win._rebuild_keep_scroll()
+                pump(app, 350)
+                _legacy_val = _bar.value()
+            finally:
+                win._restore_scroll = _real_restore
+                _bar.setValue(0)
+                pump(app, 200)
+            check("反例：恢复逻辑写回老样子时，视图**确实**被推下去了（判据不是空的）",
+                  _legacy_val > 8, "老写法重建后 %d" % _legacy_val)
+
+            # 焦点：重建会把输入框删掉 → Qt 把焦点丢给滚动区（实测），
+            #       用户接着打字就打到空气里；而且 `setFocus` 自己也会让滚动区滚过去。
+            win._fields[_fkey].box.setFocus()
+            pump(app, 120)
+            win._rebuild_keep_scroll()
+            pump(app, 300)
+            check("重建后焦点**回到同一个字段**（能接着打字）",
+                  win._focus_key() == _fkey, repr(win._focus_key()))
     finally:
         safe(win.close)
 

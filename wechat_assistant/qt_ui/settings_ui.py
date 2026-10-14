@@ -1073,18 +1073,31 @@ class SettingsWindow(QtCore.QObject):
         win.apply_style(style)
         self._restore_scroll(pos)
 
+    #: 重建之后**补几次**滚动位置（毫秒）。
+    #:
+    #: ⚠️⚠️ **一次不够**（2026-10-15 实测）：`_render_group()` 换掉内容部件之后，
+    #:     Qt 会在**布局 / 焦点落定**时自己再把视图推下去 —— 0ms 那次放回去，
+    #:     过一会儿又会被推走。三个时刻各补一次才稳。
+    RESTORE_TICKS = (0, 50, 150)
+
     def _rebuild_keep_scroll(self) -> None:
-        """重建**当前分组**，但滚动位置不动。
+        """重建**当前分组**，但滚动位置和焦点都不动。
 
         ⚠️ 用于"同组内的重建"：恢复默认 / 保存后 / 放弃改动。
             用户报过「设置一个后保存会跳到顶部去」—— 根因就在这些重建里
             （内容层是重建的，滚动条自然归零）。
+        ⚠️⚠️ 用户又报「**修改 AI 接口后保存会跳到下面去**」（2026-10-15）——
+            重建**同时**还会把视图推下去（实测 0 → 860/883，**光调 `_render_group()`
+            就复现**，不用保存），而当时 `_restore_scroll` 对 `pos <= 0` 早退，
+            所以"停在顶部"这种情况从来没被恢复过。见 `_restore_scroll`。
         ⚠️ **切分组不要用这个**（`_switch` 里直接调 `_render_group()`）：
             换一组就应该回到顶部，否则新分组一进来停在半中间，很怪。
         """
         pos = self._scroll_pos()
+        key = self._focus_key()
         self._render_group()
-        self._restore_scroll(pos)
+        self._restore_focus(key)      # ⚠️ 顺序：先焦点、后滚动 ——
+        self._restore_scroll(pos)     #    因为 `setFocus` 自己也会让滚动区滚过去
 
     def _scroll_pos(self) -> int:
         """当前滚动位置（拿不到就 0）。"""
@@ -1093,22 +1106,62 @@ class SettingsWindow(QtCore.QObject):
         except Exception:
             return 0
 
-    def _restore_scroll(self, pos: int) -> None:
-        """把滚动位置放回去（同一轮 + 下一轮各一次，见 `set_style` 的说明）。"""
-        if pos <= 0:
-            return
+    def _focus_key(self):
+        """当前焦点在**哪个设置项**里（不在任何字段里 → None）。
 
+        ⚠️ 重建会把原来的输入框删掉 → 焦点被 Qt 丢给滚动区（实测），
+            用户接着打字就打到空气里了。所以要把焦点**放回同一个字段**。
+        """
+        try:
+            fw = QtWidgets.QApplication.focusWidget()
+        except Exception:
+            return None
+        if fw is None:
+            return None
+        for k, f in self._fields.items():
+            try:
+                if f.widget is fw or f.widget.isAncestorOf(fw):
+                    return k
+            except Exception:
+                continue
+        return None
+
+    def _restore_focus(self, key) -> None:
+        """把焦点放回**重建后的同一个字段**（拿不到就什么都不做）。"""
+        if not key:
+            return
+        f = self._fields.get(key)
+        if f is None:
+            return
+        # 文字类有 `.box`（真正的输入框）；开关 / 选项类就点它自己的部件
+        # （焦点策略是 NoFocus 的话 `setFocus` 是空操作，无害）。
+        w = getattr(f, "box", None) or f.widget
+        try:
+            w.setFocus()
+        except Exception:
+            pass
+
+    def _restore_scroll(self, pos: int) -> None:
+        """把滚动位置放回去（见 `RESTORE_TICKS`：补几次才稳）。
+
+        ⚠️⚠️ 2026-10-15 用户报「修改 AI 接口后保存会跳到下面去」。根因是这里
+            原来开头有一句 **`if pos <= 0: return`** —— "用户正停在顶部"
+            （最常见的情形）**从来不恢复**，而 `_render_group()` 会把视图推到
+            接近底部，于是保存完看到的是"跳到下面去了"。
+            **0 是合法的滚动位置，必须一起恢复** —— 别再对 0 早退。
+        """
         def _put():
             try:
-                self.scroll.verticalScrollBar().setValue(pos)
+                self.scroll.verticalScrollBar().setValue(int(pos))
             except Exception:
                 pass
 
         _put()
-        try:
-            QtCore.QTimer.singleShot(0, _put)      # UI 线程，事件循环在跑，安全
-        except Exception:
-            pass
+        for ms in self.RESTORE_TICKS:
+            try:
+                QtCore.QTimer.singleShot(ms, _put)     # UI 线程，事件循环在跑，安全
+            except Exception:
+                pass
 
     # ------------------------------------------------------------ 定位
 
