@@ -1,0 +1,38 @@
+# 探测产物（截图、dump 结果）
+out/
+
+# 运行状态（会话表、比对游标）
+state/
+
+# 整库备份（含真实聊天记录 —— 和 state/ 一样不进仓库）
+state_backup_*/
+
+# 本地密钥（API key 等）—— 绝对不要提交
+secrets.yaml
+secrets.yml
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 打包产物与打包工具的本地安装（build_exe.bat / build_exe.py）
+build/
+dist/
+*.spec.bak
+.packtools/
+.pipcache/
+.tmp/
+
+# 运行日志（打包版写在 exe 旁边）
+logs/
+
+# IDE（JetBrains）本地配置，不进仓库
+.idea/
+
+# 语料（真机截图与登记数据，本地用，不进库）
+tests/corpus/images/
+tests/corpus/cases.json
+tests/corpus/golden.json
+tests/corpus/baseline.json
