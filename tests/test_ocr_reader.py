@@ -1522,6 +1522,65 @@ def test_refer_and_card():
                          _row("αβ: x", 779, 437, 1009, 464), bx, 573) is False)
 
 
+def test_use_config():
+    """22. 设置保存后，`use_config` 要让**正在跑**的读取器立刻换上新配置。
+
+    2026-10-17 真 bug（用户报「打开了识别图片，模型还是说看不到图」）：
+    `run_watch.on_config_changed` 只换了自己那个 `cfg` 变量，读取器手里那份没换
+    —— 而 `ocr_read.attach_image` 是读屏时用**读取器的 cfg** 判断的。
+    于是开关显示已开、图片一张都不裁，**重启才生效**，且不报错。
+    """
+    print("\n22. use_config：设置保存后读取器立刻换配置（图片开关的静默失效）")
+    c_off = FakeCfg(**{"ocr_read.attach_image": False, "ocr_read.record": False})
+    c_on = FakeCfg(**{"ocr_read.attach_image": True, "ocr_read.record": True})
+
+    # ① OcrReader：换对象 + 重算构造时缓存过的值
+    r = R.OcrReader(c_off)
+    check("OcrReader 一开始拿的是旧配置", r.cfg is c_off)
+    check("  background_read_ok 跟旧配置走", r.background_read_ok is False)
+    r.use_config(c_on)
+    check("use_config 之后 cfg 换成新的", r.cfg is c_on)
+    check("  ⚠️ background_read_ok 也重算了（不能只在构造时算一次）",
+          r.background_read_ok is True)
+
+    # ② 行为：那个开关真的读**当前** cfg（同一实例，不重建）
+    from PIL import Image
+    area = Image.new("RGB", (400, 300), "white")
+    rects = [(20, 20, 320, 200)]      # 够大，不会被"像头像"那条判据丢掉
+    r2 = R.OcrReader(c_off)
+    s1 = ChatSnapshot(title="测试会话")
+    r2._finish(s1, area, list(rects))
+    check("开关关着时 snap.images 是空的", s1.images == [], "%r" % (s1.images,))
+    r2.use_config(c_on)
+    s2 = ChatSnapshot(title="测试会话")
+    r2._finish(s2, area, list(rects))
+    check("  ⚠️ 换配置后**同一个实例**立刻开始裁图", len(s2.images) == 1,
+          "%d 张" % len(s2.images))
+
+    # ③ 日志节流：这个开关一开，每拍都会算一遍 —— 数量没变就别刷屏
+    logs = []
+    r3 = R.OcrReader(c_on, logger=logs.append)
+    for _ in range(3):
+        r3._finish(ChatSnapshot(title="测试会话"), area, list(rects))
+    hits = [m for m in logs if "附带" in m]
+    check("  「附带 N 张」只报一次（每拍都会走到，不节流会刷满日志）",
+          len(hits) == 1, "3 拍报了 %d 次" % len(hits))
+
+    # ④ WeChatReader（UIA 链路）：同样要有这个方法
+    from wechat_assistant.reader import WeChatReader
+    w = WeChatReader(c_off, None)
+    w.use_config(c_on)
+    check("WeChatReader.use_config 换上了新配置", w.cfg is c_on)
+
+    # ⑤ AutoReader：三条链路都要换到（含**将来才懒建**的 OCR 那份）
+    a = R.AutoReader(c_off, None)
+    a.use_config(c_on)
+    check("AutoReader.use_config 换上了新配置", a.cfg is c_on)
+    check("  ⚠️ 懒建 OcrReader 用的那份（_ocr_cfg）也换了",
+          a._ocr_cfg is c_on)
+    check("  ⚠️ 已经建好的 UIA 读取器也换了", a.uia.cfg is c_on)
+
+
 def main():
     test_module_structure()      # ⚠️ 放第一个：结构坏了后面全是噪音
     test_probe_stays_cheap()
@@ -1546,6 +1605,7 @@ def main():
     test_session_list()
     test_clean_title()
     test_refer_and_card()
+    test_use_config()
     print("\n" + "=" * 62)
     print("通过 %d，失败 %d" % (PASS, FAIL))
     return 0 if FAIL == 0 else 1

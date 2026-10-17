@@ -15,6 +15,8 @@
 import os
 from typing import Any, Optional
 
+import copy
+
 import yaml
 
 from . import paths
@@ -50,6 +52,26 @@ class Config:
     def section(self, dotted: str) -> dict:
         v = self.get(dotted, {})
         return v if isinstance(v, dict) else {}
+
+    def update_from(self, other) -> None:
+        """把另一份配置的内容**原地**换进本对象（**对象本身不换**）。
+
+        ⚠️⚠️ 为什么非要"原地"（2026-10-17 的血案）：本进程里**一堆对象在构造时
+        就把 cfg 存成了 `self.cfg`**（读取器 / 跟随器 / 记录器 / 触发器 / 界面…）。
+        设置保存时如果只是 `cfg = new_cfg` 换个变量，那些对象手里**还是旧对象**
+        —— 于是"设置里显示已保存、实际完全没生效"，**而且不报错**。
+        这个坑在本项目至少栽过 6 次：`AIClient`（模型/上下文长度）、跟随器
+        （`ui.attach`）、不透明度、置顶、知识库开关、图片开关（2026-10-17）。
+
+        现在两类都要做，缺一不可：
+            ① `cfg.update_from(new)` —— 让**所有持有者**自动看到新值（治本）；
+            ② 派生值缓存过的对象仍要重建 / `use_config()`（`AIClient`、
+               `reader` 的 `background_read_ok` 这类"构造时算好存起来"的）。
+
+        ⚠️ 用 `deepcopy` 接过来：否则两份配置会共享嵌套 dict，改一边脏另一边。
+        """
+        data = getattr(other, "_data", other) or {}
+        self._data = copy.deepcopy(data)
 
     def __repr__(self) -> str:
         return "<Config path=%s>" % self.path

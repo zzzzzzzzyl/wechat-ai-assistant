@@ -229,14 +229,21 @@ def get_relationship(cfg, session_key: str) -> str:
     return cfg.get("persona.default_relationship", "") or ""
 
 
-def _kb_query(current_text: str, user_intent: str = "") -> str:
+def _kb_query(current_text: str, user_intent: str = "",
+              with_context: bool = False) -> str:
     """拿什么去知识库里查。
 
     ⚠️ **不用整段历史**：历史是"更早的话题"，拿它去查会把无关内容的片段检索进来。
     优先级（`RAG调研.md` §5.4）：
         ① 「我想说」—— 用户已经把他关心什么说出来了，最准；
         ② 当前屏上标着 `>>` 的那条（这次要回应的）；
-        ③ 当前屏最后两条别人的正文（去掉 `>>` 前缀）。
+        ③ 当前屏最后两条别人的正文（去掉 `>>` 前缀）—— **只有 `with_context=True` 才加**。
+
+    ⚠️⚠️ **为什么要 `with_context`**（2026-10-17 用户实测）：
+        一屏里常混着几个话题（"1加一等于多少" / "分布式训练为什么要并行" / "怎么并行" /
+        ">> 你的毕业论文选什么"）。把锚点和两条背景**拼一起**查，覆盖率被稀释 ——
+        锚点明明有资料（毕设开题报告），却**一个字都没查到**；
+        只用锚点查就命中了。所以调用方**先用锚点查，空了再补背景重试**。
 
     返回 "" = 这次不检索（由调用方跳过）。
     """
@@ -271,8 +278,9 @@ def _kb_query(current_text: str, user_intent: str = "") -> str:
         tail.append(_strip_who(s))
     if anchor:
         parts.append(anchor)
-    # 最后两条（锚点之后往前数的补充内容）
-    parts.extend([s for s in tail[-2:] if s])
+    if with_context:
+        # 最后两条（同一屏里、锚点之前的背景）—— 容易把话题带偏，所以只在"补查"时加
+        parts.extend([s for s in tail[-2:] if s])
     return " ".join(p for p in parts if p)[:200]
 
 
@@ -644,8 +652,22 @@ def main():
 
         还有些东西**构造时就定死了**（记录节奏、历史库容量、注册表名单），
         那些在 SPEC 里标了「需重启」，只能重启。
+
+        ⚠️⚠️ **先是"原地换内容"，再是"换对象 / 重建缓存"**（2026-10-17）。
+        为什么两步都要：本进程里一堆对象在构造时就把 cfg 存成了 `self.cfg`
+        （读取器 / 跟随器 / 触发器 / 记录器 / 界面…），只做 `cfg = new_cfg`
+        的话它们手里还是旧对象 —— 这就是"设置显示已保存、实际没生效"的根源，
+        本项目在 `AIClient`、跟随器、不透明度、置顶、知识库、图片开关上各栽过一次。
+        `cfg.update_from()` 治本；重建 `AIClient` / `use_config()` 治那些
+        **构造时把派生值算好存起来**的（`background_read_ok`、`vision_model` 之类）。
         """
         nonlocal cfg, ai, follower
+        # ① **原地**换内容：所有持有者（不管它有没有 use_config）立刻看到新值
+        try:
+            cfg.update_from(new_cfg)
+        except Exception as e:
+            log("原地更新配置失败（可能有个功能还用旧值）: %s: %s"
+                % (type(e).__name__, e))
         cfg = new_cfg
         # ⚠️ **跟随器也要换配置对象**。它每拍读的是构造时传进去那个对象，
         #    而这里 `cfg = new_cfg` 是**换了个新对象**（不是原地改）。
@@ -655,11 +677,34 @@ def main():
                 follower.use_config(cfg)
             except Exception as e:
                 log("跟随器换配置失败: %s: %s" % (type(e).__name__, e))
+        # ⚠️⚠️ **读取器也必须换**（2026-10-17 真 bug）：`ocr_read.attach_image`
+        #    是在读屏时用**读取器自己的 cfg** 判断的（`OcrReader._finish` /
+        #    `WeChatReader.read_chat`）。这里只换外面这个 `cfg` 的话，
+        #    开关"显示已打开"、图片却一张都不裁，**要重启才生效**，
+        #    而且全程不报错 —— 用户看到的就是「模型说它看不到图」。
+        try:
+            reader.use_config(cfg)
+        except Exception as e:
+            log("读取器换配置失败（图片开关/几何参数可能不生效）: %s: %s"
+                % (type(e).__name__, e))
         try:
             ai = AIClient(cfg, logger=log)
             log("配置已重新加载（AI 参数、上下文长度、会话级人设/关系立即生效）")
         except Exception as e:
             log("重建 AI 客户端失败（沿用旧的）: %s: %s" % (type(e).__name__, e))
+        # ⚠️ 触发器也要换（2026-10-17 审计查出来的最后一处）：`min_interval`
+        #    是**构造时读进属性**的，`Config.update_from()` 治不到它 ——
+        #    不刷新的话「高级 → 两次触发最小间隔」改了完全没反应，且不报错。
+        #    ⚠️ 可能还没建（`trigger.enabled=false` 或启动阶段），所以要用
+        #      try 兜住 NameError（那时它还是个未绑定的局部变量）。
+        try:
+            if trigger is not None:
+                trigger.use_config(cfg)
+        except NameError:
+            pass
+        except Exception as e:
+            log("触发器换配置失败（触发间隔可能不生效）: %s: %s"
+                % (type(e).__name__, e))
         # ⚠️ 知识库同理：**刚在设置里打开的开关要立刻生效**（不然只有生成前那次
         #    `ensure_kb()` 兜着，日志里要等到下一次生成才看得到库的规模）。
         try:
@@ -1191,22 +1236,35 @@ def main():
             if _kb is not None and cfg.get("kb.enabled", False):
                 if registry.kb_enabled(sess):
                     try:
-                        _q = _kb_query(current_text, user_intent)
-                        if _q:
-                            extra_context = _kb.render(
-                                _q,
+                        # ⚠️ **两段式**（2026-10-17 用户实测）：一屏里混着几个话题时，
+                        #    把锚点和两条背景拼成一个查询，覆盖率会被稀释 ——
+                        #    锚点明明有资料却一个字都查不到。所以：
+                        #      第 1 段：只用「我想说」+ 锚点（干净）；
+                        #      第 2 段：第 1 段空了，才补上最近两条背景再查一次。
+                        def _try(q, tag):
+                            if not q:
+                                return ""
+                            ctx = _kb.render(
+                                q,
                                 top_k=int(cfg.get("kb.top_k", 3) or 3),
                                 min_ratio=float(cfg.get("kb.min_ratio", 0.6) or 0.6),
+                                min_coverage=float(cfg.get("kb.min_coverage", 0.3)),
                                 max_chars=int(cfg.get("kb.max_chars", 600) or 600))
-                            if extra_context:
-                                # ⚠️ 日志里要能看出**几条**：这是测试时唯一的判据
-                                #    （OR 查询几乎不会 0 结果，所以"有没有【参考资料】"
-                                #     判断不出命中好坏，得看条数和查询词）。
-                                log("[KB] 命中 %d 条，进 prompt %d 字（查询：%s）"
-                                    % (extra_context.count("【资料 "),
-                                       len(extra_context), _q[:40]))
-                            else:
-                                log("[KB] 没查到相关的资料，这次不带参考资料")
+                            if ctx:
+                                # 日志里要能看出**几条**和**哪一段**（测试时唯一的判据）
+                                log("[KB] 命中 %d 条（%s），进 prompt %d 字（查询：%s）"
+                                    % (ctx.count("【资料 "), tag, len(ctx), q[:40]))
+                            return ctx
+
+                        _q1 = _kb_query(current_text, user_intent)
+                        extra_context = _try(_q1, "查询=锚点")
+                        if not extra_context:
+                            _q2 = _kb_query(current_text, user_intent,
+                                            with_context=True)
+                            if _q2 and _q2 != _q1:
+                                extra_context = _try(_q2, "查询=锚点+背景")
+                        if not extra_context:
+                            log("[KB] 没查到相关的资料，这次不带参考资料")
                     except Exception as e:
                         # ⚠️ 像 bug 的异常要打调用栈，别让"知识库静默不工作"变成悬案
                         extra_context = ""
@@ -1216,13 +1274,27 @@ def main():
                     log("[KB] 这个会话没开知识库（会话面板里可以打开）")
             try:
                 # ⚠️ 图片只有 `ocr_read.attach_image` 打开时才会有
-                #    （见 `OcrReader._crop_images`）；关着时 `snap.images` 恒为空。
+                #    （见 `OcrReader._crop_images` / `reader._crop_images_from_window`）；
+                #    关着时 `snap.images` 恒为空。
+                # ⚠️ 这一行日志是排查「模型说看不到图」的**唯一判据** ——
+                #    开关开着却打 0 张，就看是读取器里那个开关没生效（重启前
+                #    改的设置曾经不生效，2026-10-17 已修），还是本屏真没有图片。
+                _n_img = len(snap.images or ())
+                if _n_img:
+                    # ⚠️ `ai` 可能是 None（AI 模块没加载起来时），
+                    #    别让"打一行日志"自己抛异常、把原因盖掉
+                    log("本次带图 %d 张（视觉模型：%s）"
+                        % (_n_img, getattr(ai, "vision_model", "")))
+
+                elif cfg.get("ocr_read.attach_image"):
+                    log("本次没带图：开关是开的，但这屏没有可裁的图片")
                 replies = ai.generate_replies(persona, history, current_text,
                                               extra_context=extra_context,
                                               style_samples=samples,
                                               relationship=relationship,
                                               user_intent=user_intent,
                                               images=(snap.images or None))
+
                 intent = getattr(ai, "last_intent", "") or ""
                 if intent:
                     log("判断: %s" % intent)

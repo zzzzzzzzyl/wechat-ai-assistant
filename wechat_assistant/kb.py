@@ -69,12 +69,32 @@ CRUMB_MAX = 20
 #: 单片上限。实测 150/300/400/800 字对召回只差 5pp，取中间的。
 DEFAULT_CHUNK_CHARS = 400
 
+#: **精度门槛：命中覆盖率**（命中数 / 查询二字组数）。0.3 是实测出来的膝盖点。
+#:
+#: ⚠️⚠️ 为什么必须有它（2026-10-17 用户实测）：微信里在聊物理（合力/分力/静摩擦），
+#:    当前要回的那句是「怎么改变」→ 查询只有 3 个二字组（怎么/么改/改变），
+#:    于是每个命中都只碰到 1 个，而且碰到的是「怎么」这种哪都有的虚词 ——
+#:    【参考资料】里被塞进了**毕设选题报告**和 **Transformer 参数量**。
+#:    实测（examples 语料 43 片 / 19 条该中的问法 / 10 条资料里根本没有的）：
+#:      不加门槛      → 该中的 19/19，**不该中的 9/10 也返回了东西**（用户看到的就是这个）
+#:      覆盖率 0.3 + 至少 3 个 → 该中的 **19/19**，不该中的 **1/10**
+#:    单用"至少 2 个"不行（虚词凑得出 2 个），单用 0.34 会误杀两条真命中。
+MIN_COVERAGE = 0.3
+
+#: 命中数下限。**分长短查询**（实测出来的，别合并成一个数）：
+#:   · 查询短（<6 个二字组）→ 2 个就够（"A2 耐温多少"这种 5 个组、真命中 2 个）；
+#:   · 查询长（>=6）→ 3 个（"怎么改变"只有 3 个组、撞 1 个虚词，必须挡住；
+#:     "文档拆多长一片比较好"有 9 个组、真命中 3 个，要保住）。
+#: 只用"比例"分不开这两个：前者 1/3=0.33，后者 3/9=0.33 —— **绝对个数**才分得开。
+MIN_HITS_SHORT = 2
+MIN_HITS = 3
+
 #: 一次导入最多多少片（防止有人拖进 100MB 的手册把索引撑爆）
 MAX_CHUNKS = 200000
 
 #: 检索时先取多少条候选（给"相对门槛剪枝"和"总字数额度"留余量）。
 #: ⚠️ 别取 3：剪枝后可能一条不剩 —— 症状是"明明有资料却查不到"。
-FETCH_N = 12
+FETCH_N = 24
 
 #: 库结构的版本（`PRAGMA user_version`）。改了表结构就 +1 并在 `_migrate` 里加一段。
 #:   1 = 2026-10-17 加 `grp`（分组）
@@ -469,6 +489,9 @@ class KnowledgeBase:
     def __init__(self, path: Optional[str] = None,
                  chunk_chars: int = DEFAULT_CHUNK_CHARS,
                  ocr_pdf: bool = False,
+                 min_coverage: float = MIN_COVERAGE,
+                 min_hits: int = MIN_HITS,
+                 min_hits_short: int = MIN_HITS_SHORT,
                  logger: Callable[[str], None] = None):
         self.path = os.path.abspath(path or paths.resolve("state", "kb.db"))
         self.chunk_chars = int(chunk_chars)
@@ -476,6 +499,10 @@ class KnowledgeBase:
         #: 有文字层的 PDF 根本不需要它；扫描件没有文字层，任何抽取工具都抽不出字，
         #: 想让程序硬认才打开这个开关（慢，约 0.4s/页）。
         self.ocr_pdf = bool(ocr_pdf)
+        #: 精度门槛（见 `MIN_COVERAGE` / `MIN_HITS`）：命中太少就当"没查到"。
+        self.min_coverage = float(min_coverage)
+        self.min_hits = int(min_hits)
+        self.min_hits_short = int(min_hits_short)
         self._log = logger or (lambda msg: None)
         self._lock = threading.Lock()
         self._ensure_schema()
@@ -938,15 +965,31 @@ class KnowledgeBase:
     # -- 检索 ----------------------------------------------------------
 
     def search(self, query: str, top_k: int = 3, min_ratio: float = 0.6,
+               min_coverage: float = MIN_COVERAGE,
                fetch: int = FETCH_N) -> List[Dict]:
         """检索 → [{doc, crumb, text, score}]，按相关度排序。
 
         ⚠️ **任何异常都返回 []（打一行日志）**：检索坏了不许让生成失败。
         ⚠️ `min_ratio`：只保留分数不差于"首位 × 0.6"的片（bm25 是负数，越小越相关）。
+        ⚠️⚠️ **还要过"覆盖率门槛"**（`MIN_COVERAGE` / `MIN_HITS`）：只碰到一两个
+            二字组、而且碰的多半是「怎么」这种虚词 → 判成**没查到**。
+            不加这道闸，任何一句话都能"命中"点什么，用户看到的就是
+            「聊物理却给出毕设选题报告」（2026-10-17 实测）。
         """
         expr = build_query(query)
         if not expr:
             return []
+        # 覆盖率的分母：查询切出来的二字组（和 `build_query` 用同一份，别各算一次）
+        grams = [g for g in bigrams(sanitize_query(query)).split()
+                 if g.strip()][:12]
+        if not grams:
+            return []
+        # ⚠️ 下限**分长短查询**（理由见 `MIN_HITS_SHORT` / `MIN_HITS` 那两段实测），
+        #    再和"覆盖率"取较大者。`-(-a // 1)` 是整数版向上取整（不为此 import math）。
+        _floor = self.min_hits_short if len(grams) < 6 else self.min_hits
+        ok_rate = (self.min_coverage if min_coverage is None else float(min_coverage))
+        need = max(min(_floor, len(grams)),
+                   int(-(-len(grams) * ok_rate // 1)))
         try:
             with self._lock:
                 con = self._connect()
@@ -973,6 +1016,10 @@ class KnowledgeBase:
         for name, crumb, text, score in rows:
             if cut is not None and score > cut:
                 continue
+            # ⚠️ 命中数要**连 crumb 一起数** —— 标题也进了索引（§5.1 那条）。
+            flat = "".join((text or "").split()) + "".join((crumb or "").split())
+            if sum(1 for g in grams if g in flat) < need:
+                continue
             out.append({"doc": name, "crumb": crumb or "",
                         "text": text or "", "score": score})
             if len(out) >= max(1, int(top_k)):
@@ -980,12 +1027,14 @@ class KnowledgeBase:
         return out
 
     def render(self, query: str, top_k: int = 3, min_ratio: float = 0.6,
+               min_coverage: float = MIN_COVERAGE,
                max_chars: int = 600, per_chunk: int = 300) -> str:
         """检索并渲染成 `extra_context`（**不含**【参考资料】标题，那由 ai 拼）。
 
         返回 "" = 这次没有可用资料（调用方 `extra_context=""` 时整段都不出现）。
         """
-        hits = self.search(query, top_k=top_k, min_ratio=min_ratio)
+        hits = self.search(query, top_k=top_k, min_ratio=min_ratio,
+                           min_coverage=min_coverage)
         if not hits:
             return ""
         parts: List[str] = []

@@ -600,6 +600,112 @@ def test_title_walls(tmp):
     check("  ⚠️ 归一化会统一大小写", norm_title("项目A") == norm_title("项目a"))
 
 
+def test_config_change_reaches_reader(tmp):
+    """7h. 设置保存后**必须把新配置交给读取器**（否则图片开关静默不生效）。
+
+    2026-10-17 真 bug：用户打开「识别图片」，模型仍然说看不到图。
+    `on_config_changed` 换了 `cfg` 变量、重建了 `AIClient`，**唯独没换读取器
+    手里那份 cfg** —— 而 `ocr_read.attach_image` 是读屏时用读取器的 cfg 判断的。
+
+    为什么用 AST 查：这条链只在**真机 + 保存设置**时才走到，动态测试覆盖不到
+    （和 §7g 同一个理由）。
+    """
+    print("\n7h. on_config_changed 要把新配置交给读取器（图片开关的静默失效）")
+    import ast
+    import os as _os
+    root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    src = open(_os.path.join(root, "run_watch.py"), encoding="utf-8").read()
+    tree = ast.parse(src)
+
+    fn = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "on_config_changed":
+            fn = node
+            break
+    check("run_watch.py 里能找到 on_config_changed()", fn is not None)
+    if fn is None:
+        return
+
+    called = set()
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Call):
+            f = node.func
+            # 匹配 reader.use_config(...) / self.reader.use_config(...)
+            if isinstance(f, ast.Attribute) and f.attr == "use_config":
+                base = f.value
+                name = getattr(base, "id", None) or getattr(base, "attr", "")
+                called.add(name)
+    check("它调了 reader.use_config()", "reader" in called,
+          "实际调用: %s" % (sorted(called) or "无"))
+    check("  ⚠️ 跟着它一起的 follower 也换了（回归：别再漏一个）",
+          "follower" in called, "实际调用: %s" % (sorted(called) or "无"))
+
+
+def test_config_change_updates_in_place(tmp):
+    """7i. `on_config_changed` 要先**原地**换内容（`cfg.update_from`）。
+
+    为什么：进程里一堆对象构造时就把 cfg 存成了 `self.cfg`，只 `cfg = new_cfg`
+    的话它们手里还是旧对象 → "设置显示已保存、实际没生效"。
+    同一类坑栽过 6 次（AIClient / 跟随器 / 不透明度 / 置顶 / 知识库 / 图片开关），
+    所以这条要静态钉住 —— 真机保存才走到，动态测试覆盖不到（同 §7g / §7h）。
+    """
+    print("\n7i. on_config_changed 必须原地换配置（cfg.update_from）")
+    import ast
+    import os as _os
+    root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    src = open(_os.path.join(root, "run_watch.py"), encoding="utf-8").read()
+    tree = ast.parse(src)
+
+    fn = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "on_config_changed":
+            fn = node
+            break
+    check("run_watch.py 里能找到 on_config_changed()", fn is not None)
+    if fn is None:
+        return
+
+    calls = []
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            calls.append(node.func.attr)
+    check("它调了 cfg.update_from()", "update_from" in calls,
+          "实际调用: %s" % (sorted(set(calls)) or "无"))
+
+
+def test_config_change_refreshes_trigger(tmp):
+    """7j. `on_config_changed` 也要刷新触发器（`trigger.min_interval` 曾被冻结）。
+
+    2026-10-17 审计（`tools/audit_cfg_frozen.py`）查出来的最后一处：
+    `TriggerManager.min_interval` 是**构造时读进属性**的，`Config.update_from()`
+    治不到它 —— 于是「高级 → 两次触发最小间隔」改了没反应，要重启才认。
+    """
+    print("\n7j. on_config_changed 要刷新触发器（min_interval 是冻结值）")
+    import ast
+    import os as _os
+    root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    src = open(_os.path.join(root, "run_watch.py"), encoding="utf-8").read()
+    tree = ast.parse(src)
+
+    fn = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "on_config_changed":
+            fn = node
+            break
+    check("run_watch.py 里能找到 on_config_changed()", fn is not None)
+    if fn is None:
+        return
+
+    receivers = set()
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
+                and node.func.attr == "use_config":
+            base = node.func.value
+            receivers.add(getattr(base, "id", None) or getattr(base, "attr", ""))
+    check("它调了 trigger.use_config()", "trigger" in receivers,
+          "实际接收者: %s" % (sorted(receivers) or "无"))
+
+
 def main():
     print("=" * 76)
     print("会话注册表测试（默认模式 / 白名单 / 黑名单 / 隐私边界）")
@@ -620,6 +726,9 @@ def main():
         test_merge_variants(tmp)
         test_merge_known_sessions(tmp)
         test_run_watch_defines_before_use(tmp)
+        test_config_change_reaches_reader(tmp)
+        test_config_change_updates_in_place(tmp)
+        test_config_change_refreshes_trigger(tmp)
         test_title_walls(tmp)
         test_normalize_mode(tmp)
 

@@ -115,6 +115,30 @@ class TriggerManager:
         self._hwnd = None
         self._hotkey_id = 1
 
+    def use_config(self, cfg) -> None:
+        """设置保存后换一份新配置（**不重启就生效**）。
+
+        ⚠️ 为什么需要（2026-10-17 审计查出来的最后一处漏网）：
+            `min_interval` 是**构造时读进属性**的（`fire()` 每拍都用它），
+            而 `run_watch.on_config_changed()` 原来既不换这个对象、
+            更新 `cfg` 内容也到不了它 —— 于是「高级 → 两次触发最小间隔」
+            改了**一点反应都没有**，要重启才认，且不报错。
+            （`Config.update_from()` 治的是"调用时读"，治不了这种"构造时冻结"。）
+
+        ⚠️ 这里**只刷新能让它当场生效的那些**：
+            · `min_interval` —— `fire()` 每次都读属性，换了立刻管用；
+            · `hotkey_spec` / `on_window_focus` / `on_session_switch` **不在这里刷**：
+              热键是启动时 `RegisterHotKey` 注册的，改了得重新注册（SPEC 已标
+              `restart=True`）；后两个要重新挂/摘窗口事件钩子，而它们在 SPEC 里
+              本来就没有界面项（只在 `config.yaml` 里）。
+        """
+        self.cfg = cfg
+        try:
+            self.min_interval = float(cfg.get("trigger.min_interval", 3.0))
+        except Exception as e:
+            self._log("刷新触发间隔失败（沿用 %.1fs）: %s: %s"
+                      % (self.min_interval, type(e).__name__, e))
+
     # ------------------------------------------------------------ 触发入口
 
     def fire(self, reason: str) -> bool:

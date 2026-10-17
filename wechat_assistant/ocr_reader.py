@@ -1494,6 +1494,24 @@ class OcrReader:
         #:    **根本跑不动**（一拍比间隔还长，会自由狂奔），
         #:    1s 一拍也要常驻三成的一个核。默认只在你要的时候读一屏。
         self.background_read_ok = bool(cfg.get("ocr_read.record", False))
+        #: 「附带 N 张图片给模型看」那行日志的节流标记。
+        #: ⚠️ **必须在 `__init__` 里初始化**（项目铁律：实例属性先赋值再读，
+        #:    有 AST 守门测试 `test_ocr_reader` §17 查这条）。
+        self._img_logged = None
+
+    def use_config(self, cfg) -> None:
+        """设置界面保存后换一份新配置（**不重启就生效**）。
+
+        ⚠️⚠️ 2026-10-17 真 bug：用户打开「识别图片」后**模型仍然说看不到图**。
+        根因是 `run_watch.on_config_changed` 只换了自己那个 `cfg` 变量，
+        读取器手里这份没换 —— 而 `ocr_read.attach_image` 正是在读屏时
+        用**读取器自己的 cfg** 判断的。于是开关显示已开、图片一张都不裁，
+        **要重启才生效**，且全程不报错。
+        ⚠️ `background_read_ok` 是构造时算好缓存的，这里必须一起重算，
+           否则设置里打开「后台记录」也要重启（同一个坑的第二张脸）。
+        """
+        self.cfg = cfg
+        self.background_read_ok = bool(cfg.get("ocr_read.record", False))
 
     # ------------------------------------------------------------ 引擎
 
@@ -1878,8 +1896,15 @@ class OcrReader:
         #    （不裁剪、不压缩、不编码，零开销）。
         if self.cfg.get("ocr_read.attach_image"):
             snap.images = self._crop_images(area, snap.messages)
-            if snap.images:
-                self._log("附带 %d 张图片给模型看" % len(snap.images))
+            # ⚠️ 这行**每拍都会算**（读屏一直在跑），必须节流：数量变了才报。
+            #    不节流的话开着开关时终端每 0.5 秒刷一行，日志里别的信息全被冲掉。
+            n_img = len(snap.images)
+            if n_img != self._img_logged:
+                self._img_logged = n_img
+                if n_img:
+                    self._log("附带 %d 张图片给模型看" % n_img)
+                else:
+                    self._log("本屏没有可发的图片（开关是开的）")
 
     # ------------------------------------------------------------ 几何
 
@@ -2680,6 +2705,26 @@ class AutoReader:
                       "或 ocr（只用 OCR）。")
 
     # ------------------------------------------------------------ 对外
+
+    def use_config(self, cfg) -> None:
+        """换一份新配置（设置保存后立刻生效）—— 三条链路都要换到。
+
+        ⚠️ 漏掉任何一条都会让某个开关"显示已开、实际没生效"：
+            `self.cfg` 给 AutoReader 自己用、`self._ocr_cfg` 是**将来才懒建**
+            的 OcrReader 的配置来源、`self.uia` 已经建好了、`self.ocr`
+            可能已经建好了（切换过之后）。
+        """
+        self.cfg = cfg
+        self._ocr_cfg = cfg
+        try:
+            self.uia.use_config(cfg)
+        except Exception as e:
+            self._log("UIA 读取器换配置失败: %s: %s" % (type(e).__name__, e))
+        if self.ocr is not None:
+            try:
+                self.ocr.use_config(cfg)
+            except Exception as e:
+                self._log("OCR 读取器换配置失败: %s: %s" % (type(e).__name__, e))
 
     @property
     def background_read_ok(self) -> bool:

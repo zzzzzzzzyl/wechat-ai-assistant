@@ -633,6 +633,44 @@ def test_only_changes():
         shutil.rmtree(tmp2, ignore_errors=True)
 
 
+def test_update_from_in_place(tmp):
+    """9c. `Config.update_from`：**旧对象**也要看到新值（"改了不生效"的根治）。
+
+    2026-10-17：设置保存时原来是 `cfg = new_cfg`（换变量），而进程里一堆对象
+    在构造时就把 cfg 存成了 `self.cfg` —— 它们手里还是旧对象，于是
+    "显示已保存、实际没生效"，而且不报错。同一类坑本项目栽过 6 次。
+    """
+    print("\n9c. 原地更新配置（持有旧 cfg 的对象必须看到新值）")
+    from wechat_assistant.config import Config
+
+    old = Config({"ai": {"model": "旧的", "n_replies": 3}, "ui": {"opacity": 1.0}},
+                 "c.yaml")
+    new = Config({"ai": {"model": "新的", "n_replies": 5}, "ui": {"opacity": 0.6}},
+                 "c.yaml")
+
+    # 模拟"某个对象在构造时抓走了 cfg"
+    holder = old
+    old.update_from(new)
+    check("持有者看到新值（不是旧对象）", holder.get("ai.model") == "新的",
+          repr(holder.get("ai.model")))
+    check("  改过的数字项也换了", holder.get("ai.n_replies") == 5,
+          repr(holder.get("ai.n_replies")))
+    check("  嵌套层的值也换了", abs(holder.get("ui.opacity") - 0.6) < 1e-9,
+          repr(holder.get("ui.opacity")))
+    check("  ⚠️ 对象本身没被换掉（`is` 不变，持有者才有效）", holder is old)
+
+    # ⚠️ 不能共享嵌套 dict：否则改一边脏另一边（下一拍读到的是别人的中间状态）
+    new.get("ai")["model"] = "又改了"
+    check("  ⚠️ 两份配置不共享嵌套 dict（deepcopy）",
+          holder.get("ai.model") == "新的", repr(holder.get("ai.model")))
+
+    # 键被删掉时也要真的消失（不是"旧值残留")
+    new2 = Config({"ai": {}}, "c.yaml")
+    holder.update_from(new2)
+    check("  新配置里删掉的键，旧对象也读不到了",
+          holder.get("ai.model", "缺省") == "缺省", repr(holder.get("ai.model")))
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="dsh_settings_")
     try:
@@ -650,6 +688,7 @@ def main():
         test_spec(tmp)
         test_spec_covers_config()
         test_only_changes()
+        test_update_from_in_place(tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

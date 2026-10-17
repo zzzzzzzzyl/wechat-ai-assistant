@@ -54,11 +54,22 @@ def iter_py(root):
 
 
 def staged_files(root):
-    out = subprocess.run(["git", "diff", "--cached", "--name-only",
-                          "--diff-filter=ACM"],
-                         cwd=root, capture_output=True, text=True).stdout
-    return [os.path.join(root, line.strip()) for line in out.splitlines()
-            if line.strip().endswith(".py")]
+    """已暂存的 .py 文件（git 钩子用）。
+
+    ⚠️ 2026-10-17 修：原来写 `capture_output=True, text=True`，让 subprocess 按
+        **系统编码**（本机是 GBK）去解码 git 的输出 —— 而仓库里有**中文文件名**
+        （`设置项怎么改.md`），于是抛 `UnicodeDecodeError`、`stdout` 变成 `None`，
+        钩子自己崩掉。表现是**提交被拦住，报的却是一个和语法无关的栈**
+        （我以为是钩子拦了语法错误，白看了半分钟）。
+        → 现在：`-z`（NUL 分隔、不转义文件名）+ 自己按 UTF-8 解码，还要容忍 stdout 为 None。
+    """
+    p = subprocess.run(["git", "-c", "core.quotepath=false",
+                        "diff", "--cached", "--name-only", "-z",
+                        "--diff-filter=ACM"],
+                       cwd=root, capture_output=True)
+    out = (p.stdout or b"").decode("utf-8", "replace")
+    return [os.path.join(root, name) for name in out.split("\0")
+            if name.strip().endswith(".py")]
 
 
 def check(files, root):

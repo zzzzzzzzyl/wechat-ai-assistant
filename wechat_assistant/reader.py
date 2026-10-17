@@ -476,6 +476,17 @@ class WeChatReader:
         """
         return None
 
+    def use_config(self, cfg) -> None:
+        """设置界面保存后换一份新配置（**不重启就生效**）。
+
+        ⚠️⚠️ 为什么必须有这个方法（2026-10-17 真 bug，用户报「打开了识别图片，
+        模型还是说看不到图」）：`run_watch.on_config_changed` 当时只换了自己那个
+        `cfg` 变量 + 重建 `AIClient`，**没换读取器手里这份** —— 而
+        `ocr_read.attach_image` 是在读屏时用**读取器自己的 cfg** 判断的。
+        于是开关"显示已打开"、图片却一张都不裁，**重启才正常**，且不报错。
+        """
+        self.cfg = cfg
+
     def __init__(self, cfg, worker, logger: Callable[[str], None] = None):
         self.cfg = cfg
         self.worker = worker
