@@ -21,14 +21,12 @@
 """
 
 import ctypes
-import os
 import time
 from typing import Callable, Optional, Tuple
 
 import win32api
 import win32con
 import win32gui
-import win32process
 
 # 面板与微信窗口之间留的空隙（基准像素，按 DPI 缩放由调用方传入）
 DEFAULT_GAP = 8
@@ -62,64 +60,28 @@ ATTACH_FLOAT = "float"
 ATTACH_OFF = "off"
 
 
-def _exe_of_pid(pid: int) -> str:
-    """取进程的 exe 全路径。
-
-    ⚠️ **不启子进程** —— 沙箱禁止管道，`subprocess.run(capture_output=True)`
-    会 EPERM，所以只走纯 win32。
-    """
-    h = None
-    try:
-        h = win32api.OpenProcess(0x1000, False, pid)     # QUERY_LIMITED_INFORMATION
-        return win32process.GetModuleFileNameEx(h, 0) or ""
-    except Exception:
-        return ""
-    finally:
-        if h is not None:
-            try:
-                win32api.CloseHandle(h)
-            except Exception:
-                pass
-
-
 def find_wechat_window(cfg) -> int:
-    """找微信主窗口（面积最大的那个 QWindowIcon）。
+    """找微信主窗口（**复用读取层那套判据**）。
+
+    ⚠️⚠️ 原来这里按「**面积最大的** QWindowIcon」挑 —— 是错的（2026-10-17 修）：
+       微信的「图片和视频」预览实测 **711480 px²，比主窗口 544887 还大**，
+       于是用户打开图片时**面板会贴到图片窗口上**（用户报的正是这个）。
+       现在走 `winlocate.pick_window`：标题 + owner + `WS_CAPTION`，
+       和 `reader.find_window()` **同一个口径**（两边口径不一致时，
+       读取跟窗口会挑到不同目标，症状是"面板贴错 / 读不到"）。
+
+    ⚠️ 挑不出来返回 0 —— 跟随时保持原地不动，**不要**退回"面积最大"
+       （那又贴回图片窗口了）。
 
     用 `EnumWindows` 而不是 UIA —— 这里只需要一个 HWND，
-    走 UIA 反而有 provider 卡死的风险。
+    走 UIA 反而有 provider 卡死的风险（`winlocate` 也刻意不 import uiautomation）。
     """
-    proc = str(cfg.get("wechat.proc_name", "Weixin.exe") or "Weixin.exe").lower()
-    hint = str(cfg.get("wechat.window_class_contains", "QWindowIcon") or "QWindowIcon")
-    found = []
-    name_ok = {"seen": False}
-
-    def cb(hwnd, _):
-        try:
-            if not win32gui.IsWindowVisible(hwnd):
-                return True
-            cls = win32gui.GetClassName(hwnd)
-            if hint not in cls:
-                return True
-            _, pid = win32process.GetWindowThreadProcessId(hwnd)
-            exe = os.path.basename(_exe_of_pid(pid)).lower()
-            if exe:
-                name_ok["seen"] = True
-                if exe != proc:
-                    return True
-            r = win32gui.GetWindowRect(hwnd)
-            found.append((hwnd, (r[2] - r[0]) * (r[3] - r[1]), r))
-        except Exception:
-            pass
-        return True
+    from .winlocate import find_main_hwnd
 
     try:
-        win32gui.EnumWindows(cb, None)
+        return find_main_hwnd(cfg)
     except Exception:
         return 0
-    if not found:
-        return 0
-    found.sort(key=lambda t: -t[1])
-    return found[0][0]
 
 
 def work_area() -> Tuple[int, int, int, int]:

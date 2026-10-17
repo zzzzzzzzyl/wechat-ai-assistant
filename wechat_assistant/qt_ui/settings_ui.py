@@ -56,6 +56,7 @@ Tk 专属补丁全部消失（这是迁移的理由，不是副作用）
     `messagebox`                                     `QMessageBox`
 """
 
+import os
 import threading
 from typing import Callable, Dict, Optional
 
@@ -244,7 +245,9 @@ def _ask_yes_no(parent, title: str, text: str, yes: str = "确定",
     dlg = ShellDialog(st, title, parent, modal=True, min_width=DIALOG_MIN_W)
     dlg.add_text(text)
     # ⚠️ 顺序跟设置窗口底部那排一致：取消（左、次要）→ 确定（右、主要）
-    dlg.add_button(no, variant="ghost")
+    # ⚠️⚠️ **取消那颗必须 `accept=False`**，否则点取消也会 `accept()`，
+    #    这个函数就恒为 True —— 确认框的"取消"等于"确定"（2026-10-17 用户报的）。
+    dlg.add_button(no, variant="ghost", accept=False)
     dlg.add_button(yes, variant="primary")
     return dlg.exec() == QtWidgets.QDialog.Accepted
 
@@ -896,7 +899,9 @@ class SettingsWindow(QtCore.QObject):
                  preselect: Optional[str] = None,
                  seen_source: Optional[Callable[[], dict]] = None,
                  on_show_prompt: Optional[Callable[[], None]] = None,
-                 on_show_read: Optional[Callable[[], None]] = None):
+                 on_show_read: Optional[Callable[[], None]] = None,
+                 kb=None,
+                 on_kb_change: Optional[Callable[[str, bool], None]] = None):
         super().__init__()
         self.cfg = cfg
         self.store = store
@@ -924,6 +929,14 @@ class SettingsWindow(QtCore.QObject):
         # 由 `FloatingAssistant` 注入（那两个方法本来就在面板上，只依赖它自己）。
         self._on_show_prompt = on_show_prompt
         self._on_show_read = on_show_read
+        # ---- 知识库（2026-10-17）----
+        # `kb` 由 run_watch 注入**同一个实例**：设置里导完，生成那次马上就能查到，
+        # 不用重启、也不用两处各建一个库（两个实例会各自开连接，容易踩并发写）。
+        self._kb_obj = kb
+        # 会话面板那个「用知识库」开关写回注册表 —— 跟模式一样走注入的回调。
+        self._on_kb_change = on_kb_change
+        #: 知识库里**折叠起来的分组**（只记在本次运行，不落盘 —— 重开窗口默认全展开）。
+        self._kb_collapsed = set()
         self._preselect = preselect
         self._session_panel: Optional[SessionPanel] = None
         # ⚠️ **暂存必须跨分组切换存活**：改了会话设置又切到别的分组再点保存，
@@ -1515,6 +1528,12 @@ class SettingsWindow(QtCore.QObject):
             if i < len(items) - 1:
                 self.scroll.add(hline(st))
 
+        # 知识库组：SPEC 只有「启用」一行，下面接一块**手写的文件清单**
+        # （列表 + 按钮塞不进 SPEC 的一行一项模型，跟「会话」分组同一个理由）。
+        if self._group == "kb":
+            self.scroll.add(hline(st))
+            self.scroll.add(self._build_kb_files())
+
     # ------------------------------------------------------------ 会话面板
 
     def _stash_session(self):
@@ -1539,11 +1558,418 @@ class SettingsWindow(QtCore.QObject):
             session_source=self._session_source,
             seen_source=self._seen_source,
             on_mode_change=self._on_mode_change,
+            on_kb_change=self._on_kb_change,
+            kb_enabled_source=self._kb_global_on,
             logger=self._log,
             preselect=sel,
             stage=self._session_stage,
         )
         self._custom_lay.addWidget(self._session_panel, 1)
+
+    # ------------------------------------------------------------ 知识库清单
+    #
+    # ⚠️ 这里是一块**手写控件**，不是 SPEC 项（列表 + 按钮塞不进一行一项的模型）。
+    #    用户定的形态：单库、全局一份资料、出厂关。
+    # ⚠️ 三条"不写就会出事"的（`RAG调研.md` §5.10）：
+    #    ① 导入后要显示「N 份 · M 段 · K 字」——否则用户不知道生效没有；
+    #    ② 要能**预览抽出的内容**——PDF/表格抽坏了不会报错；
+    #    ③ 导入失败要**在界面上说**，不能只打日志。
+
+    def _kb(self):
+        """知识库对象（惰性创建；`run_watch` 注入了就用它那个）。"""
+        if self._kb_obj is None:
+            from ..kb import KnowledgeBase
+            self._kb_obj = KnowledgeBase(logger=self._log)
+        return self._kb_obj
+
+    def _kb_global_on(self) -> bool:
+        """全局知识库现在开没开 —— **界面上的当前值优先**。
+
+        ⚠️ 不能只读 `store`：用户刚在「知识库」组拨了开关（还没落盘，那边有
+        400ms 防抖）就切到「会话」组，读 store 会拿到旧值 →
+        会话面板会把开关"藏起来"，看起来像刚开就坏了。
+        """
+        f = self._fields.get("kb.enabled") if self._fields else None
+        if f is not None:
+            try:
+                return bool(f.get())
+            except Exception:
+                pass
+        try:
+            return bool(self.store.get("kb.enabled", False))
+        except Exception:
+            return False
+
+    @staticmethod
+    def _fmt_chars(n: int) -> str:
+        n = int(n or 0)
+        return ("%.1f 千字" % (n / 1000.0)) if n >= 1000 else ("%d 字" % n)
+
+    def _build_kb_files(self):
+        st = self.style
+        box = QtWidgets.QWidget(self.scroll.inner)
+        # ⚠️ 打个名字：这一块**不是 SPEC 的一行**（是手写的清单 + 按钮），
+        #    而 `test_qt_settings_ui` §10c 是"按 SPEC 的行数逐个对"的 ——
+        #    它得能把这坨跳过去，否则会拿它去查 SPEC 里不存在的键（实测 KeyError '?'）。
+        box.setObjectName("kb-files")
+        lay = QtWidgets.QVBoxLayout(box)
+        lay.setContentsMargins(st.S("xl"), st.S("md"), st.S("xl"), st.S("lg"))
+        lay.setSpacing(0)
+
+        docs, total, groups = [], {"docs": 0, "chunks": 0, "chars": 0}, []
+        load_err = ""
+        try:
+            kb = self._kb()
+            docs = kb.list_documents()
+            total = kb.summary()
+            groups = kb.groups()
+        except Exception as e:
+            load_err = "%s: %s" % (type(e).__name__, e)
+            self._log("读知识库失败: %s" % load_err)
+
+        lay.addWidget(label(st, "我的资料", font_name="body", color_key="text"))
+        lay.addSpacing(st.S("xs"))
+        if load_err:
+            lay.addWidget(label(st, "读不到资料库（%s）" % load_err,
+                                font_name="small", color_key="danger", wrap=True))
+        else:
+            lay.addWidget(label(
+                st, "已导入 %d 份 · %d 段 · %s"
+                    % (total["docs"], total["chunks"], self._fmt_chars(total["chars"])),
+                font_name="small", color_key="text_dim", wrap=True))
+        lay.addSpacing(st.S("md"))
+
+        if not docs and not load_err:
+            lay.addWidget(label(st, "还没有导入资料。支持纯文本和 Markdown 文件。",
+                                font_name="small", color_key="text_faint", wrap=True))
+            lay.addSpacing(st.S("md"))
+
+        # ---- 按分组画：组标题一行（可折叠）+ 组内逐个文件
+        #
+        # ⚠️ 分组**只影响显示和批量操作，不参与检索**（检索永远全库）。
+        # ⚠️ 组是**实体**（`kb_groups` 表）：先建组、再往组里加文件，
+        #    刚建好的空组也要看得见 —— 否则用户会说"我明明建了"。
+        by_grp = {}
+        for d in docs:
+            by_grp.setdefault(d["grp"], []).append(d)
+        for gi, g in enumerate(groups):
+            grp = g["grp"]
+            if gi:
+                lay.addSpacing(st.S("md"))
+                lay.addWidget(hline(st))
+                lay.addSpacing(st.S("md"))
+            collapsed = grp in self._kb_collapsed
+            head = QtWidgets.QHBoxLayout()
+            head.setContentsMargins(0, 0, 0, 0)
+            head.setSpacing(st.S("xs"))
+            # 折叠三角：整组收起/展开（状态只在**本次运行**里记，不落盘）
+            head.addWidget(Pill(st, "▾" if not collapsed else "▸",
+                                lambda gg=grp: self._kb_fold(gg),
+                                variant="text", parent=box), 0)
+            head.addWidget(label(st, g["label"], font_name="body_bold",
+                                 color_key="text"), 0)
+            head.addWidget(label(st, "%d 份 · %d 段" % (g["docs"], g["chunks"]),
+                                 font_name="small", color_key="text_faint"), 0)
+            head.addStretch(1)
+            head.addWidget(Pill(st, "加文件", lambda gg=grp: self._kb_add(gg),
+                                variant="text", parent=box), 0)
+            head.addWidget(Pill(st, "刷新", lambda gg=grp: self._kb_reload(gg),
+                                variant="text", parent=box), 0)
+            if grp:
+                head.addWidget(Pill(st, "删组", lambda gg=grp: self._kb_delete_group(gg),
+                                    variant="text", parent=box), 0)
+            lay.addLayout(head)
+            lay.addSpacing(st.S("xs"))
+
+            if collapsed:
+                continue
+            for d in by_grp.get(grp, []):
+                row = QtWidgets.QWidget(box)
+                rl = QtWidgets.QHBoxLayout(row)
+                # ⚠️ 文件行**靠左边距缩进**，别用空格前缀（"    " + 名字）——
+                #    空格宽度跟字体走，换主题/换字号就错位了。
+                rl.setContentsMargins(st.S("md"), 0, 0, 0)
+                rl.setSpacing(st.S("sm"))
+                name_txt = d["name"]
+                if not d.get("path_exists"):
+                    # ⚠️ 原文件没了**不影响已导入的内容**（存的是抽出来的文本），
+                    #    但用户迟早会问"我的文件呢"，所以这里说清楚。
+                    name_txt += "（原文件不在了）"
+                rl.addWidget(label(st, name_txt, font_name="body",
+                                   color_key="text"), 1)
+                info = "%d 段 · %s · %s" % (d["chunks"], self._fmt_chars(d["chars"]),
+                                            (d["updated_at"] or "")[5:16])
+                rl.addWidget(label(st, info, font_name="small",
+                                   color_key="text_faint"), 0)
+                rl.addWidget(Pill(st, "移除", lambda n=d["name"]: self._kb_remove(n),
+                                  variant="text", parent=row), 0)
+                lay.addWidget(row)
+                lay.addSpacing(st.S("xs"))
+
+        # ---- 底部按钮
+        lay.addSpacing(st.S("sm"))
+        btns = QtWidgets.QHBoxLayout()
+        btns.setContentsMargins(0, 0, 0, 0)
+        btns.setSpacing(st.S("sm"))
+        btns.addWidget(Pill(st, "新建分组…", lambda: self._kb_new_group(),
+                            variant="ghost", parent=box), 0)
+        # ⚠️ 「添加文件夹」= 分组最省事的入口：**子目录名就是组名**，
+        #    按目录摆好资料一次导进来就分好组了。
+        btns.addWidget(Pill(st, "添加文件夹…", lambda: self._kb_add_folder(),
+                            variant="ghost", parent=box), 0)
+        if docs:
+            btns.addWidget(Pill(st, "刷新全部", lambda: self._kb_reload(None),
+                                variant="ghost", parent=box), 0)
+        btns.addStretch(1)
+        lay.addLayout(btns)
+
+        lay.addSpacing(st.S("md"))
+        lay.addSpacing(st.S("xs"))
+        lay.addWidget(label(
+            st, "资料库保存在本地，检索到相关段落后发给服务商。",
+            font_name="small", color_key="text_faint", wrap=True))
+        lay.addStretch(1)
+        return box
+
+    def _kb_fold(self, grp: str):
+        """折叠 / 展开一个分组（状态只记在**本次运行**里，不落盘）。"""
+        if grp in self._kb_collapsed:
+            self._kb_collapsed.discard(grp)
+        else:
+            self._kb_collapsed.add(grp)
+        self._rebuild_keep_scroll()
+
+    def _kb_new_group(self):
+        """新建一个空组（先建组、再往组里加文件）。"""
+        name = self._prompt("新建分组", "给这一组起个名字。", "")
+        if name is None:
+            return
+        try:
+            self._kb().create_group(name)
+        except Exception as e:
+            _error(self.win, "建不了这个分组", "%s" % e, style=self.style)
+            return
+        self._rebuild_keep_scroll()
+        self._say("已新建分组「%s」，点它右边的「加文件」往里加" % name.strip())
+
+    def _kb_delete_group(self, grp: str):
+        """删组：组里还有资料就**连资料一起删**（确认框里写明）。"""
+        if not self.show_dialogs:
+            return
+        n = sum(1 for d in self._kb().list_documents() if d["grp"] == grp)
+        tip = ("把「%s」这一组删掉？" % grp) + (
+            "\n组里还有 %d 份资料，会一起删掉（原文件不受影响）。" % n if n else "")
+        if not _ask_yes_no(self.win, "删除分组", tip, yes="删除", no="取消",
+                           style=self.style):
+            return
+        try:
+            self._kb().delete_group(grp, with_docs=True)
+        except Exception as e:
+            _error(self.win, "删除失败", "%s" % e, style=self.style)
+            return
+        self._kb_collapsed.discard(grp)
+        self._rebuild_keep_scroll()
+        self._say("已删除分组「%s」%s" % (grp, ("（含 %d 份资料）" % n) if n else ""))
+
+    def _prompt(self, title: str, tip: str, value: str = ""):
+        """一行文字的输入框（`ShellDialog` + `EntryBox`）。取消返回 None。"""
+        from .layout import ShellDialog
+        st = self.style
+        if not self.show_dialogs:
+            return None
+        dlg = ShellDialog(st, title, self.win, modal=True, min_width=DIALOG_MIN_W)
+        dlg.add_text(tip)
+        boxe = EntryBox(st, text=value, parent=dlg)
+        dlg.body.addWidget(boxe)
+        got = {"v": None}
+
+        def _ok():
+            got["v"] = boxe.text()
+
+        # ⚠️⚠️ **取消必须 `accept=False`**：否则点取消也会 accept()，
+        #    这个函数就返回空串 ""（而不是 None），调用方拿去建组 → 弹"组名不能为空"。
+        dlg.add_button("取消", variant="ghost", accept=False)
+        dlg.add_button("确定", variant="primary", on_click=_ok)
+        if dlg.exec() != QtWidgets.QDialog.Accepted:
+            return None
+        return got["v"] if got["v"] is not None else ""
+
+    def _kb_add(self, grp: str = ""):
+        """选文件 → 导入到**指定分组**（不传 = 默认组）。
+
+        ⚠️ 组行上的「加文件」把组名传进来 —— 这就是"先建组、再往组里加文件"，
+           不需要事后再挪，所以文件行上没有「移到…」。
+        """
+        paths_, _f = QtWidgets.QFileDialog.getOpenFileNames(
+            self.win, "选择要导入的资料（会放进「%s」）" % (grp or "默认"), "",
+            "资料 (*.md *.txt *.pdf *.docx);;文本文档 (*.md *.txt);;PDF (*.pdf);;"
+            "Word (*.docx);;所有文件 (*.*)")
+        if not paths_:
+            return
+        ok = skipped = 0
+        errs = []
+        notes = []
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        try:
+            kb = self._kb()
+            for p in paths_:
+                try:
+                    r = kb.add_document(p, grp=grp or "")
+                    if r.get("skipped"):
+                        skipped += 1
+                    else:
+                        ok += 1
+                    if r.get("note"):
+                        notes.append("%s：%s" % (os.path.basename(p), r["note"]))
+                except Exception as e:
+                    errs.append("%s：%s" % (os.path.basename(p), e))
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+        self._kb_collapsed.discard(grp)      # 加完把这一组展开，不然看不见刚加的
+        self._rebuild_keep_scroll()
+        if errs:
+            _error(self.win, "有文件没导进去", "\n".join(errs[:6]), style=self.style)
+        elif skipped and not ok:
+            self._say("这些资料之前导入过，内容没变，已跳过")
+        else:
+            self._say("导入了 %d 份资料，共 %d 段" % (
+                ok, self._kb().summary()["chunks"]))
+        if notes:
+            # ⚠️ "有 3 页没有文字层"这类**必须说出来**：用户以为导全了，
+            #    结果那几页查不到，比直接报错还难排查。
+            _error(self.win, "导入了，但有几点要注意",
+                   "\n".join(notes[:6]), style=self.style)
+
+    def _kb_add_folder(self):
+        """**整个文件夹变成一个组**，组名就是文件夹名（用户 2026-10-17 定的口径）。
+
+        ⚠️ 之前是"子目录名当组名"，选一个大目录会炸出一堆组、还按路径拼名字；
+           现在"一个文件夹 = 一个组"，想分几个组就选几次不同文件夹，最好理解。
+        ⚠️ 文件夹名是保留名（「默认」）时落进默认组，不报错。
+        """
+        from ..kb import NO_GROUP_LABEL
+        root = QtWidgets.QFileDialog.getExistingDirectory(
+            self.win,
+            "选一个文件夹（整个文件夹变成一个分组；里面的 Markdown / 文本 / PDF / Word 都会导入）")
+        if not root:
+            return
+        name = os.path.basename(os.path.normpath(root)) or ""
+        grp = "" if name == NO_GROUP_LABEL else name
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        try:
+            r = self._kb().import_tree(root, grp=grp)
+        except Exception as e:
+            QtWidgets.QApplication.restoreOverrideCursor()
+            _error(self.win, "导入失败", "%s" % e, style=self.style)
+            return
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+        self._kb_collapsed.discard(grp)
+        self._rebuild_keep_scroll()
+        errs = r.get("errors") or []
+        if errs:
+            _error(self.win, "有文件没导进去",
+                   "\n".join("%s：%s" % (n, e) for n, e in errs[:6]), style=self.style)
+            return
+        # ⚠️ 状态行只有一行，**一条消息说完**（连调两次 _say，前一条会被覆盖掉）。
+        # ⚠️ 文件夹里那些**不支持的格式**要数给用户看：静默跳过的话，
+        #    他会以为整个文件夹都导进来了。
+        ign = r.get("ignored") or {}
+        msg = "导入了 %d 份到「%s」" % (r.get("ok", 0), grp or NO_GROUP_LABEL)
+        if r.get("skipped"):
+            msg += "，%d 份没变" % r["skipped"]
+        if ign:
+            msg += "；跳过 %s（格式还不支持）" % "、".join(
+                "%s×%d" % (k, v) for k, v in sorted(ign.items())[:3])
+        self._say(msg)
+        notes = r.get("notes") or []
+        if notes:
+            _error(self.win, "导入了，但有几点要注意",
+                   "\n".join("%s：%s" % (n, t) for n, t in notes[:6]),
+                   style=self.style)
+
+    def _kb_remove(self, name: str):
+        if not self.show_dialogs:
+            return
+        if not _ask_yes_no(self.win, "移除资料",
+                           "把《%s》从资料库里删掉？\n原文件不受影响。" % name,
+                           yes="移除", no="取消", style=self.style):
+            return
+        try:
+            n = self._kb().remove_document(name)
+        except Exception as e:
+            _error(self.win, "删除失败", "%s" % e, style=self.style)
+            return
+        self._rebuild_keep_scroll()
+        self._say("已移除《%s》（%d 段）" % (name, n))
+
+    def _kb_reload(self, grp=None):
+        """**刷新**：按原路径把资料再读一遍（改了原文件后用）。
+
+        `grp=None` = 全部；给了分组就只刷那一组。
+
+        ⚠️ 界面上叫「刷新」而不是「重新导入」（用户要求）：它做的事就是"把原文件
+            的最新内容同步过来"，叫"导入"会让人以为要重新选一遍文件。
+        ⚠️ 内容没变的会**自动跳过**（`kb.add_document` 按内容指纹比），
+            所以这个按钮点几次都只是"同步一下"，不会把片翻倍。
+        ⚠️ 刷新**沿用原来的分组**（`add_document(path)` 不传 grp）——
+            改个文件不该把它踢回「默认」组。
+        ⚠️ 原文件不在了的**跳过并计数**：已导入的内容还在，别让它被删掉。
+        """
+        docs, ok, skipped, errs = [], 0, 0, []
+        try:
+            docs = [d for d in self._kb().list_documents()
+                    if d.get("path_exists") and (grp is None or d["grp"] == grp)]
+        except Exception as e:
+            _error(self.win, "读不到资料列表", "%s" % e, style=self.style)
+            return
+        if not docs:
+            self._say("这一组没有能刷新的资料（原文件都不在了）")
+            return
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        try:
+            for d in docs:
+                try:
+                    r = self._kb().add_document(d["path"])
+                    if r.get("skipped"):
+                        skipped += 1
+                    else:
+                        ok += 1
+                except Exception as e:
+                    errs.append("%s：%s" % (d["name"], e))
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+        self._rebuild_keep_scroll()
+        if errs:
+            _error(self.win, "有文件没能刷新", "\n".join(errs[:6]), style=self.style)
+        else:
+            self._say("刷新完成：更新 %d 份，没变 %d 份" % (ok, skipped))
+
+    def _kb_preview(self):
+        """看清楚**抽出来的是什么** —— 抽坏了不会报错，只能靠眼睛。"""
+        from .layout import ShellDialog
+        st = self.style
+        try:
+            text = self._kb().dump()
+        except Exception as e:
+            _error(self.win, "读不到内容", "%s" % e, style=self.style)
+            return
+        dlg = ShellDialog(st, "抽出的内容（模型看到的就是这些）", self.win,
+                          modal=True, min_width=520)
+        view = QtWidgets.QPlainTextEdit()
+        view.setReadOnly(True)
+        view.setPlainText(text or "（空的）")
+        view.setFont(st.font("small"))
+        view.setFixedHeight(st.px(320))
+        view.setStyleSheet(
+            "QPlainTextEdit { background:%s; color:%s; border:1px solid %s;"
+            " border-radius:%dpx; padding:%dpx; }"
+            % (st.p["surface"], st.p["text"], st.p["border"],
+               st.R("control"), st.S("sm")))
+        dlg.body.addWidget(view)
+        dlg.add_button("关闭", variant="primary")
+        if self.show_dialogs:
+            dlg.exec()
 
     # ------------------------------------------------------------ 表单一行
 

@@ -55,6 +55,7 @@ from typing import Callable, Dict, List, Optional
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from .base import Style, hand_cursor, qc
+from .cards import Switch
 from .inputs import EntryBox, InputBox
 from .layout import ScrollArea, WrapGroup
 from .widgets import Pill
@@ -109,6 +110,7 @@ def session_rows(
     disabled: Optional[List[str]],
     default_mode: str = "off",
     seen: Optional[Dict[str, str]] = None,
+    kb_default: bool = True,
 ) -> List[dict]:
     """把「注册表里的会话」和「各处配置」合成一行一条的视图。
 
@@ -142,6 +144,8 @@ def session_rows(
             "known": key in sessions,          # 注册表里有没有（微信里出现过没有）
             "persona": (personas.get(key) or ""),
             "relationship": (relationships.get(key) or ""),
+            # 这个会话要不要用知识库（注册表里的字段，默认关）。
+            "kb": bool(s.get("kb_enabled", kb_default)),
             "blacklisted": key in dset,
             "custom": bool(personas.get(key) or relationships.get(key)),
             # 两个来源取**较新的**那个：注册表的"刚打开过"、屏快照库的"最后记录过"。
@@ -375,6 +379,8 @@ class SessionPanel(QtWidgets.QWidget):
 
     def __init__(self, master, style: Style, store, session_source=None,
                  on_mode_change: Optional[Callable[[str, str], None]] = None,
+                 on_kb_change: Optional[Callable[[str, bool], None]] = None,
+                 kb_enabled_source: Optional[Callable[[], bool]] = None,
                  logger: Optional[Callable[[str], None]] = None,
                  preselect: Optional[str] = None,
                  stage: Optional[dict] = None,
@@ -389,6 +395,15 @@ class SessionPanel(QtWidgets.QWidget):
         #:    （`SessionRegistry.save()` 会把 sessions 整个写盘）。
         self._seen_source = seen_source
         self._on_mode_change = on_mode_change
+        #: 「用知识库」开关（2026-10-17）——**立即生效**，不暂存。
+        #: ⚠️ 和模式/人设不同：那两样是"改完按保存"，这一个点一下就直接写回注册表。
+        #:    有意的 —— 它是一个会话级的独立开关，没有"检查一遍再一起提交"的必要，
+        #:    而"点了没反应要记得按保存"正是这个项目最烦的那种体验。
+        self._on_kb_change = on_kb_change
+        #: 全局知识库开没开（`kb.enabled`）。没开就**不画**这个会话的开关。
+        #: ⚠️ 用回调而不是直接读 store：设置窗口那边有 400ms 防抖，
+        #:    刚拨完开关就切分组会读到旧值。
+        self._kb_source = kb_enabled_source
         self._log = logger or (lambda m: None)
 
         self._sel: Optional[str] = None
@@ -629,6 +644,25 @@ class SessionPanel(QtWidgets.QWidget):
         self._tip(lay, "留空 = 用全局默认「%s」。影响称呼、语气和分寸。" % default_rel)
         lay.addSpacing(st.px(10))
 
+        # ---- 用知识库（2026-10-17）
+        #
+        # ⚠️ **全局没启用时这一行不出现**（用户要求：「打开后会话才显示这个开关选项」）。
+        #    理由：一个点了没用的开关比没有开关更糟 —— 用户会以为"开了它就该工作"。
+        #    这里改成给一行灰字说明，指路到「知识库」那一组。
+        # ⚠️ 判断走**注入的回调**（`kb_enabled_source`），不是直接读 store：
+        #    用户可能在「知识库」组里刚拨了开关、还没落盘就切到这一组来 ——
+        #    读 store 会读到旧值（那边有 400ms 防抖）。
+        # ⚠️ **立即生效**（见 `_on_kb_change` 的说明），所以这里不登记进 `_ed`/暂存。
+        if self._kb_available():
+            lay.addWidget(_label(st, "知识库", font_name="body", color_key="text"))
+            lay.addSpacing(st.px(4))
+            kb_sw = Switch(st, bool(row.get("kb")),
+                           lambda on, k=key: self._kb_toggle(k, on), parent=box)
+            lay.addWidget(kb_sw, 0, QtCore.Qt.AlignLeft)
+            lay.addSpacing(st.px(3))
+            self._tip(lay, "打开后，回复前会先在你导入的资料里查相关内容。")
+            lay.addSpacing(st.px(10))
+
         if row["custom"]:
             self._tip(lay, "这个会话已经有单独设置。把上面两个框清空即可恢复全局。",
                       color_key="accent")
@@ -636,8 +670,36 @@ class SessionPanel(QtWidgets.QWidget):
         lay.addStretch(1)
         self._ed = {"mode": mode_w, "persona": box_persona, "rel": rel}
 
-    # ------------------------------------------------------------ 暂存
+    # ------------------------------------------------------------ 知识库开关
 
+    def _kb_available(self) -> bool:
+        """全局知识库开没开（拿不到就按"没开"处理，宁可少画一个开关）。"""
+        if self._kb_source is None:
+            return False
+        try:
+            return bool(self._kb_source())
+        except Exception:
+            return False
+
+    def _kb_toggle(self, key: str, on: bool):
+        """「用知识库」点一下 → 立刻写回注册表（不暂存、不用按保存）。"""
+        if not self._on_kb_change:
+            self._log("知识库开关没有人接收（run_watch 没注入回调），这次点击无效")
+            return
+        try:
+            self._on_kb_change(key, bool(on))
+        except Exception as e:
+            self._log("写知识库开关失败: %s: %s" % (type(e).__name__, e))
+            return
+        # ⚠️ **必须同时更新面板自己缓存的那一行**：`_render_editor` 是从
+        #    `_rows_data` 画的，不改的话"切到别的会话再切回来"会显示**旧值**
+        #    （开关弹回去，而注册表里其实已经改了）—— 典型的"看起来没生效"。
+        row = next((r for r in self._rows_data if r.get("key") == key), None)
+        if row is not None:
+            row["kb"] = bool(on)
+        self._log("会话「%s」的知识库：%s" % (key, "开" if on else "关"))
+
+    # ------------------------------------------------------------ 暂存
     def _stash(self):
         """把当前编辑框的内容收进暂存。切会话/切分组/保存前都要调。
 

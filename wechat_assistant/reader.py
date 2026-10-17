@@ -40,6 +40,12 @@ SCOPE_DESCENDANTS = 4
 # 实测在底部时 gap 正好是 0（不是「大约 0」），所以 4 足够。
 BOTTOM_TOLERANCE = 4
 
+#: 「UIA 树正常」的门槛（后代控件数）。正常环境 160 个，拿不到的环境 2 个。
+#: ⚠️ 用在两处：后端选路（`ocr_reader.make_reader`）和**多候选时挑主窗口**
+#:    （`WeChatReader._pick_by_health`）—— 后者是 2026-10-17 加的：
+#:    「图片和视频」预览可能也叫「微信」，纯 Win32 分不开时用它兜底。
+UIA_HEALTH_MIN = 20
+
 # 会话名里可能出现的尾部标记
 SESSION_FLAGS = ("消息免打扰", "草稿", "未读")
 
@@ -363,82 +369,15 @@ def _rect_of(elem):
 
 # ------------------------------------------------------------------ 定位窗口
 
-def list_windows(cfg) -> List[dict]:
-    """列出所有「像微信主窗口」的候选（纯 Win32，不碰 UIA）。
-
-    只按进程名 + 窗口类过滤，**不做取舍** —— 取舍在 `pick_window()` 里，
-    这样两者可以分开测。
-    """
-    proc_name = (cfg.get("wechat.proc_name", "Weixin.exe") or "").lower()
-    class_hint = (cfg.get("wechat.window_class_contains", "QWindowIcon") or "").lower()
-    found = []
-
-    def cb(hwnd, _):
-        try:
-            if not win32gui.IsWindowVisible(hwnd):
-                return True
-            cls = win32gui.GetClassName(hwnd)
-            if class_hint and class_hint not in cls.lower():
-                return True
-            _, pid = win32process.GetWindowThreadProcessId(hwnd)
-            h = win32api.OpenProcess(
-                win32con.PROCESS_QUERY_LIMITED_INFORMATION, False, pid
-            )
-            try:
-                exe = win32process.GetModuleFileNameEx(h, 0)
-            finally:
-                win32api.CloseHandle(h)
-            if os.path.basename(exe).lower() != proc_name:
-                return True
-            rect = win32gui.GetWindowRect(hwnd)
-            found.append({
-                "hwnd": hwnd, "pid": pid, "exe": exe, "class": cls,
-                "title": win32gui.GetWindowText(hwnd) or "",
-                "rect": rect,
-                "area": max(0, rect[2] - rect[0]) * max(0, rect[3] - rect[1]),
-            })
-        except Exception:
-            pass
-        return True
-
-    win32gui.EnumWindows(cb, None)
-    return found
+# ⚠️ 2026-10-17：`list_windows` / `pick_window` 已搬到 `winlocate.py` ——
+#    `follow`（跟随）也要用**同一套判据**挑窗口，而它不能 import 本模块
+#    （本模块顶部 import uiautomation，而 follow 是每拍跑的）。
+#    这里 re-export，保持老引用（probes/ 有十几处
+#    `from wechat_assistant.reader import list_windows, pick_window`）继续可用。
+from .winlocate import list_windows, pick_window  # noqa: E402,F401
 
 
-def pick_window(cands: List[dict], cfg) -> Optional[dict]:
-    """从候选里挑出**真正的主窗口**。挑不出来返回 None。
 
-    ⚠️⚠️ 这里以前是 `found[0]` —— **盲选第一个**，是本项目最坑的一个 bug
-    （2026-09-27 第三十八轮发现，一直没改）。
-
-    微信同时会开好几个同类窗口：主窗口 / **「图片和视频」预览** / 朋友圈 / 设置，
-    它们**同名同进程同类名**，而 `EnumWindows` 的返回顺序**不保证**
-    —— 实测同一台机器跑两次顺序就变了。挑中「图片和视频」时**什么都读不到**，
-    而输出看起来和「微信改版了 / UIA 坏了」**完全分不开**。
-
-    排除法都试过、都不成立：
-      · **「取面积最大的」不行** —— 实测「图片和视频」预览 711480 px²，
-        **比主窗口的 544887 px² 还大**。
-      · 置顶过的、最后激活的也不行（用户可能正好在看别的窗口）。
-
-    **唯一可靠的纯 Win32 判据是标题**：主窗口恒为「微信」
-    （预览/朋友圈/设置都是别的名字）。
-
-    兜底策略：
-      只有 1 个候选 -> 直接用它（不管标题，兼容改版/其他语言）
-      有多个候选但只有一个**标题精确等于**「微信」 -> 用它
-      其余 -> 返回 None，**宁可不读也不瞎读**（瞎读会把无关窗口的内容当成聊天，
-               比读不到更难查）。调用方拿到 None 会记一行日志。
-    """
-    if not cands:
-        return None
-    if len(cands) == 1:
-        return cands[0]
-    want = (cfg.get("wechat.window_title", "微信") or "").strip()
-    exact = [c for c in cands if (c.get("title") or "").strip() == want]
-    if len(exact) == 1:
-        return exact[0]
-    return None
 
 
 # ------------------------------------------------------------------ 读取器
@@ -543,13 +482,25 @@ class WeChatReader:
         self._log = logger or (lambda msg: None)
         #: 上一次 find_window 挑不出来时的原因（给上层做降级判断用）
         self.last_miss = ""
+        #: 「多候选分不出主窗口」时按 UIA 控件树挑出来的结果缓存：
+        #: (候选 hwnd 集合, 选中的 hwnd)。见 `_pick_by_health`。
+        #: ⚠️ 必须**按候选集合**缓存 —— 窗口换了要重判，否则会一直用旧的那个。
+        self._health_pick = None
 
     # -------------------------------------------------- 1. 定位窗口（纯 Win32）
 
     def find_window(self) -> Optional[dict]:
-        """用 EnumWindows 找到微信主窗口。找不到返回 None。"""
+        """用 EnumWindows 找到微信主窗口。找不到返回 None。
+
+        ⚠️ 2026-10-17 加了一层兜底：`pick_window()` 是纯 Win32 的，
+           而**「图片和视频」预览可能也叫「微信」**（同名同进程同类名）——
+           那时 owner/caption 也不一定分得开。这种情况改用
+           「哪棵 UIA 树最丰富」来挑（`_pick_by_health`，**有缓存**）。
+        """
         cands = list_windows(self.cfg)
         win = pick_window(cands, self.cfg)
+        if win is None and len(cands) > 1:
+            win = self._pick_by_health(cands)
         if win is None:
             # ⚠️ 这条每拍都会走到，而 find_window 每个 tick 都调 ——
             #    不节流的话日志会被同一句话刷满（实测过一次类似的：
@@ -563,6 +514,41 @@ class WeChatReader:
         else:
             self.last_miss = ""
         return win
+
+    def _pick_by_health(self, cands):
+        """多个候选分不出时，挑**UIA 树最丰富**的那个（主窗口）。
+
+        ⚠️ 为什么需要：实测「图片和视频」预览可能也叫「微信」，
+           纯 Win32 的 owner / `WS_CAPTION` 判据不一定能分开。
+           而 UIA 能：主窗口有会话列表 + 消息控件（正常 160 个后代），
+           图片预览那棵几乎是空的（2 个）—— 门槛用 `UIA_HEALTH_MIN`。
+
+        ⚠️ 为什么不能每拍都算：一次 `uia_health` 是一次全量 FindAll（~50-90ms），
+           而 `find_window` 每拍都调。所以按**候选 hwnd 集合**缓存：
+           集合不变就直接用上次的结论；窗口变了才重判。
+
+        ⚠️ 挑不出来（全都是空树 / 体检失败 return -1）就返回 None ——
+           宁可**等待**（`run_watch` 启动时会等），也不瞎读。
+        """
+        key = tuple(sorted(c["hwnd"] for c in cands))
+        cached = self._health_pick
+        if cached and cached[0] == key:
+            hwnd = cached[1]
+            return next((c for c in cands if c["hwnd"] == hwnd), None)
+        best, best_n = None, -1
+        for c in cands:
+            try:
+                n = self.uia_health(c["hwnd"])
+            except Exception:
+                n = 0
+            if n > best_n:
+                best, best_n = c, n
+        if best is not None and best_n >= UIA_HEALTH_MIN:
+            self._health_pick = (key, best["hwnd"])
+            self._log("按 UIA 控件树挑主窗口：%r（%d 个控件）"
+                      % (best.get("title"), best_n))
+            return best
+        return None
 
     # -------------------------------------------------- 2. 轻量：会话列表
 

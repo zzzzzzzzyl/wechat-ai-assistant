@@ -20,6 +20,14 @@ MODE_OFF = "off"          # 不处理（默认）
 MODE_ON = "on"            # 提醒 + 记录 + 生成建议
 MODE_OBSERVE = "observe"  # 只记录上下文，不生成建议（预留）
 
+#: 「这个会话要不要用知识库」的**出厂默认值**（2026-10-17 用户要求改成 `True`）。
+#:
+#: ⚠️ 语义是"默认打开"，不是"默认就查"：真正要不要检索还要过**全局开关**
+#:    （`kb.enabled`，出厂是关的）。两级都开才会查 —— 出厂状态下什么都没发生。
+#: ⚠️ 老的 `state.json` 里没有这个字段的会话也按这个默认值算（见 `kb_enabled()`），
+#:    否则升级之后老会话会"突然全都不用知识库"，而且界面上看不出原因。
+KB_DEFAULT = True
+
 
 def normalize_mode(v) -> str:
     """把配置里的 mode 归一化成 'off' / 'on' / 'observe'。
@@ -270,6 +278,7 @@ class SessionRegistry:
         self.sync: Dict[str, dict] = {}
 
         self.load()
+        self._migrate_kb_default()
         self._apply_bootstrap()
         self._rebuild_norm_index()
 
@@ -300,6 +309,32 @@ class SessionRegistry:
         os.replace(tmp, self.state_path)
 
     # ------------------------------------------------------------ 白名单
+
+    def _migrate_kb_default(self) -> None:
+        """把**旧默认值写进去的** `kb_enabled=False` 改成新默认（开）。
+
+        ⚠️⚠️ 为什么必须迁移（2026-10-17 用户实测）：会话级默认从 `False` 改成 `True`
+            之后，**只有新建的会话**用新默认；老 `state.json` 里 20 个会话存的是
+            旧默认写进去的 `False` —— 用户看到的就是"还是默认关闭"。
+
+        ⚠️ 怎么区分"用户显式关掉的"和"旧默认写进去的"：靠 `kb_by_user` 标记。
+            `set_kb_enabled()` 会打这个标记；没有标记的一律视为旧默认，重新套用
+            `KB_DEFAULT`。用户真正手动关掉的会带标记，**不会被覆盖**。
+        """
+        n = 0
+        for _key, s in self.sessions.items():
+            if s.get("kb_by_user"):
+                continue
+            if bool(s.get("kb_enabled")) is not KB_DEFAULT:
+                s["kb_enabled"] = KB_DEFAULT
+                n += 1
+        if n:
+            self._log("按新的默认值打开 %d 个会话的知识库（老配置里是旧默认）" % n)
+            try:
+                self.save()
+            except Exception as e:
+                self._log("保存会话表失败（下次启动会再迁移一次）: %s: %s"
+                          % (type(e).__name__, e))
 
     def _apply_bootstrap(self) -> None:
         """套用配置里的名单：白名单启用、黑名单强制关闭。
@@ -362,7 +397,7 @@ class SessionRegistry:
             "mode": self.default_mode,
             "is_new": True,
             "persona": None,
-            "kb_enabled": False,
+            "kb_enabled": KB_DEFAULT,
             "kb_id": None,
         }
 
@@ -570,6 +605,31 @@ class SessionRegistry:
         s["enabled_by"] = "user"
         if mode != MODE_OFF:
             s["is_new"] = False
+
+    # ---- 知识库（2026-10-17）
+    #
+    # ⚠️ 这是**会话级**的第二个开关，和 `mode` 是两件事，别合并：
+    #    `mode` 管"要不要提醒/记录/生成"；`kb_enabled` 管"生成时要不要查资料"。
+    #    一个会话可以是 `observe`（只记录不生成）却仍然开着知识库（以后生成时用得上）。
+    #
+    # ⚠️ 字段早就留好了（`_new_session` 里的 `kb_enabled: False`，一直没人读）。
+    #    默认 **False**：私聊里突然冒出公司资料是灾难，所以必须一处处显式打开。
+
+    def kb_enabled(self, raw_title: str) -> bool:
+        """这个会话要不要用知识库（**出厂默认开**，见 `KB_DEFAULT`）。
+
+        ⚠️ 老 `state.json` 里没有这个字段 → 按 `KB_DEFAULT` 算，别默认成 False。
+        """
+        key = self.key_for(raw_title)
+        return bool((self.sessions.get(key) or {}).get("kb_enabled", KB_DEFAULT))
+
+    def set_kb_enabled(self, raw_title: str, on: bool) -> None:
+        key = self.key_for(raw_title)
+        s = self.sessions.setdefault(key, self._new_session(key))
+        s["kb_enabled"] = bool(on)
+        # ⚠️ 打标记：以后改 `KB_DEFAULT` 时**不要**覆盖用户手动关掉的那个
+        #    （`_migrate_kb_default()` 只迁移没有这个标记的）。
+        s["kb_by_user"] = True
 
     def touch(self, raw_title: str) -> None:
         """记下「**刚刚看到这个会话**」的时刻（设置面板按时间排要用）。

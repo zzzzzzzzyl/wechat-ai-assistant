@@ -1210,6 +1210,12 @@ def test_both_themes(app, tmp):
                 w = lay.itemAt(i).widget()
                 if w is None or w.objectName() == "hline" or w.height() <= 2:
                     continue
+                # ⚠️ 2026-10-17：「知识库」分组在 SPEC 那一行**下面**挂了一块手写的
+                #    文件清单（`settings_ui._build_kb_files`，objectName="kb-files"）。
+                #    它不是 SPEC 的一行，不能拿它去查 `SPEC_BY_KEY` ——
+                #    不跳过去的话这里会 `KeyError: '?'`（实测）。
+                if w.objectName() == "kb-files":
+                    continue
                 k = keys[ri] if ri < len(keys) else "?"
                 ri += 1
                 if _SBK[k].kind in _TALL:

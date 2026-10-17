@@ -669,6 +669,31 @@ class ReadWindow(ShellDialog):
 
 # ================================================================ 悬浮面板
 
+def wechat_hwnd(cfg) -> int:
+    """当前**微信主窗口**的 HWND（主题采样用）。拿不到返回 0。
+
+    ⚠️⚠️ 2026-10-17 修：原来这里所有调用点都写死 `hwnd=0` ——
+       而 `theme.detect()` 拿到 0 就**永远采样失败**，直接退系统主题。
+       于是日志里那句「主题：采样不到微信窗口（可能最小化）」**一直都在**，
+       用户看到的就是"主题根本不跟微信，只跟系统"（他报的正是这个）。
+
+    ⚠️ 用 `winlocate.find_main_hwnd()`（纯 Win32，和读取/跟随**同一套判据**），
+       不 import uiautomation —— 这个函数在 `Style` 构造时就会调，
+       不能有 provider 卡死风险。
+    """
+    try:
+        import os
+        # offscreen（测试/无桌面）下没有真实微信窗口可采 —— 直接 0，
+        # 免得测试去依赖桌面状态（否则测试跑在开了微信的机器上会飘）。
+        if os.environ.get("QT_QPA_PLATFORM", "").lower() == "offscreen":
+            return 0
+        from ..winlocate import find_main_hwnd
+
+        return find_main_hwnd(cfg)
+    except Exception:
+        return 0
+
+
 class FloatingAssistant(Panel):
     """悬浮面板：会话名 + 三条建议 + 「我想说」 + 生成按钮。
 
@@ -684,6 +709,8 @@ class FloatingAssistant(Panel):
                  on_settings: Optional[Callable[[], None]] = None,
                  session_source: Optional[Callable[[], dict]] = None,
                  on_mode_change: Optional[Callable[[str, str], None]] = None,
+                 kb=None,
+                 on_kb_change: Optional[Callable[[str, bool], None]] = None,
                  on_config_changed: Optional[Callable[[object], None]] = None):
         self.cfg = cfg
         self._log = logger or (lambda m: None)
@@ -698,18 +725,23 @@ class FloatingAssistant(Panel):
         # 默认返回空 —— 没有它的话列表就退回按名字排，不会崩。
         self._session_seen_source = lambda: {}
         self._on_mode_change = on_mode_change
+        # ---- 知识库（2026-10-17）：同一个库实例 + 会话开关的回调，都转给设置窗口 ----
+        self._kb = kb
+        self._on_kb_change = on_kb_change
         # 设置保存后把新 cfg 交回 run_watch —— 生成时的人设/关系是从那里读的。
         # ⚠️ 不回调的话，改了「会话级人设」界面显示已保存、生成却还用旧的，
         #    要重启才生效（那正是这个项目最怕的"静默失效"）。
         self._on_config_changed = on_config_changed
         self._on_copy = None            # 复制后通知触发源进入冷静期
         self._on_moved = None           # 用户手动挪了窗口
+        #: 「自动主题」的重采节流计数（每 5 秒看一次微信是否在前台，见 `_pump`）
+        self._auto_theme_tick = 0
 
         # ⚠️ QApplication 必须在任何 QWidget **之前**建好，而且全进程只能一个。
         #    `init_app()` 内部走 `instance() or QApplication(...)`，重复调是安全的。
         init_app([])
 
-        style = Style(cfg, 0, logger=self._log)
+        style = Style(cfg, wechat_hwnd(cfg), logger=self._log)
         radius = style.px(int(cfg.get("ui.radius", theme.SHELL_RADIUS)
                               or theme.SHELL_RADIUS))
         super().__init__(style, radius=radius)
@@ -1998,12 +2030,16 @@ class FloatingAssistant(Panel):
 
         重建比重绘每个控件简单可靠，而界面元素很少，代价可以忽略
         （Qt 里整棵重建实测 10ms 量级，Tk 版是百毫秒级）。
+
+        ⚠️ 2026-10-17：`hwnd` 以前写死 0（`theme.detect` 永远退系统主题，
+           见 `wechat_hwnd()` 的说明）。这里只算**一次**句柄，两处都用它。
         """
-        new = name or theme.detect(self.cfg, 0, self._log)
+        hwnd = wechat_hwnd(self.cfg)
+        new = name or theme.detect(self.cfg, hwnd, self._log)
         if new == self.style.theme_name:
             return
         self._log("主题切换: %s -> %s" % (self.style.theme_name, new))
-        self.style = Style(self.cfg, 0, name=new, logger=self._log)
+        self.style = Style(self.cfg, hwnd, name=new, logger=self._log)
         # 外壳半径也要跟着新缩放重算
         self.radius = self.style.px(int(self.cfg.get("ui.radius", theme.SHELL_RADIUS)
                                         or theme.SHELL_RADIUS))
@@ -2041,6 +2077,8 @@ class FloatingAssistant(Panel):
                 logger=self._log, on_saved=self._on_settings_saved,
                 session_source=self._session_source,
                 on_mode_change=self._on_mode_change,
+                kb=self._kb,
+                on_kb_change=self._on_kb_change,
                 # ⚠️ 2026-10-14：面板上那两颗按钮撤掉之后，**查看入口搬到设置里** ——
                 #    把面板自己的两个方法直接注入进去（它们本来就只依赖 `self`）。
                 on_show_prompt=self._show_prompt,
@@ -2191,7 +2229,7 @@ class FloatingAssistant(Panel):
                 self._log("回传新配置失败: %s: %s" % (type(e).__name__, e))
         # 外观：主题 + 尺寸，立即生效
         try:
-            new_theme = theme.detect(self.cfg, 0, self._log)
+            new_theme = theme.detect(self.cfg, wechat_hwnd(self.cfg), self._log)
             if new_theme != self.style.theme_name:
                 self.set_theme(new_theme)
             else:
@@ -2277,6 +2315,12 @@ class FloatingAssistant(Panel):
         """
         if getattr(self, "_quit", False):
             return
+        # ⚠️ 2026-10-17：**自动主题**的前台重采（见 `_resample_theme_foreground`）。
+        #    每 40 拍（120ms × 40 ≈ 5 秒）看一次 —— 不能每拍都抓图，
+        #    那会和 OCR 记录器抢 CPU。
+        self._auto_theme_tick += 1
+        if self._auto_theme_tick % 40 == 0:
+            self._resample_theme_foreground()
         while True:
             try:
                 kind, data = self._q.get_nowait()
@@ -2286,6 +2330,31 @@ class FloatingAssistant(Panel):
                 self._handle(kind, data)
             except Exception as e:
                 self._log("UI 处理 %r 异常: %s: %s" % (kind, type(e).__name__, e))
+
+    def _resample_theme_foreground(self):
+        """自动主题：**微信在前台时**重采一次（否则 PrintWindow 会抓到全黑）。
+
+        ⚠️ 2026-10-17 修（用户报「日志永远『采样不到微信窗口』，主题只跟系统」）：
+           `theme.sample_wechat_theme` 靠 `PrintWindow` 抓图，而 **Windows 对后台
+           窗口的 PrintWindow 会返回全黑**（实测：窗口可见、没最小化、非前台
+           → `is_blank=True`）。程序是从终端/资源管理器启动的，那一刻微信在后台
+           → 采样必然失败 → 退系统主题，而且**之后再也不重采**。
+           所以这里每 5 秒看一眼：只有当**前台就是微信主窗口**时才重采 ——
+           前台才有内容，后台重采纯属浪费一次抓图。
+        """
+        try:
+            if not theme.is_auto(self.cfg.get("ui.theme", "auto")):
+                return          # 用户钉死了 dark/light，不折腾
+            h = wechat_hwnd(self.cfg)
+            if not h:
+                return
+            import win32gui
+
+            if win32gui.GetForegroundWindow() != h:
+                return          # 微信不在前台 -> PrintWindow 全黑，别采
+            self.set_theme()
+        except Exception as e:
+            self._log("自动主题重采失败: %s: %s" % (type(e).__name__, e))
 
     def _handle(self, kind, data):
         if kind == "session":

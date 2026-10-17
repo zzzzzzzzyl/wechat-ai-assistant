@@ -22,6 +22,8 @@
 
 from typing import List, Optional, Tuple
 
+from .textfilter import is_placeholder
+
 CURSOR_UNKNOWN = None
 
 
@@ -89,11 +91,97 @@ def collect_visible_block(snap):
     ⚠️ 返回形状仍然是“统一 list 或 None”（下面那条历史原因）。
     以前这里返回过单个对象而调用处按 list 用，实机上报过
     `AttributeError: 'list' object has no attribute 'text'`。
+
+    ⚠️ **"整块都要回"不等于"每一行都要回"**（2026-10-17）：这一块里可能混着
+       `[图片]`、引用卡片、以及我自己刚说的话。真正要回应的是
+       `pick_reply_anchor()` 找出来的那条 —— 用 `render_current_block()` 渲染，
+       会在它前面标 `>> `。
     """
     msgs = [m for m in snap.messages if (m.text or "").strip()]
     if not msgs:
         return [], [], "无消息"
     return list(msgs), [], "当前屏幕的全部对话"
+
+
+#: 这些 kind 不是"谁说的话" —— 不该被当成待回复的对话行
+NONTEXT_KINDS = ("image", "emoji", "refer", "file", "link")
+
+
+def is_dialogue(item) -> bool:
+    """这条算不算「谁说的话」（可以当回复锚点、可以进历史）。
+
+    ⚠️ 判 `kind` 而不是只判 text：图片/引用/卡片在 prompt 里也是
+       `[图片]` 这种文字，但**回它没意义**（见 `render_current_block`）。
+    ⚠️ 还要判**纯占位**（2026-10-17）：UIA 路径的动画表情就是一条
+       `kind=text`、文本为 `动画表情`/`[动画表情]` 的消息 —— 只判 kind
+       会让锚点落在表情上、模型被要求"回复一个表情"。
+    """
+    kind = getattr(item, "kind", "text") or "text"
+    if kind in NONTEXT_KINDS:
+        return False
+    text = (getattr(item, "text", "") or "").strip()
+    if not text:
+        return False
+    if is_placeholder(text):
+        return False
+    return True
+
+
+def pick_reply_anchor(block) -> Optional[int]:
+    """最后一条「**别人**说的正文」—— 这次真正要回应的那条。
+
+    为什么不是"最后一条"（2026-10-17，用户反馈）：
+      · 末尾常跟着 `[图片]`、`嗯`、`好的`，或者我自己刚补的一句；
+      · 提示词第 6 条也写着「我:」不是待回复内容 —— 拿最后一条会自相矛盾；
+      · 实测（`probes/diag_context_focus.py`）当前屏常常只有 2-5 条、一半是图片，
+        模型只能抓住最后那几个字。
+
+    找不到（全是「我」/全是图片）返回 None —— 由调用方提示"可以接着自己的话说"，
+    **不要**伪造成"有锚点"。
+    """
+    for i in range(len(block or []) - 1, -1, -1):
+        it = block[i]
+        if not is_dialogue(it):
+            continue
+        if getattr(it, "is_self", None) is False:
+            return i
+    return None
+
+
+def render_current_block(block, anchor_index: Optional[int] = None):
+    """渲染 prompt 里的「当前屏幕」那一段，返回 (对话文本, 非文字说明, 锚点下标)。
+
+    ```
+    我: 在忙啊
+    >> 李四: 你昨天为什么不回我消息        ← 要回应的就是这条
+    李四: 算了 你爱怎么想怎么想吧
+    李四: [图片]
+    ```
+
+    ⚠️ 锚点用 **`>> ` 前缀**表达，而不是改文字 —— 模型看得见，用户点【看提示词】
+       也看得见；改文字会让"原文"和"喂进去的"对不上。
+
+    ⚠️ **占位消息（图片 / 动画表情 / 文件…）保留在对话行里**（2026-10-17）：
+       模型得知道"对方发的是一张图 / 一个表情"，否则它会以为对方没说话；
+       但 `is_dialogue()` 排除了它们，所以**锚点不会落在占位上**。
+       ⚠️ 视觉模型那句「对应上面第 N 个 `[图片]`」依赖 `[图片]` 文本在场 ——
+          **别在这里把它们挪走或删掉**（历史里才过滤，见 `run_watch`）。
+
+    第二个返回值现在恒为空串（留给将来做更细的分区），调用方按 `if nont:` 用即可。
+    """
+    block = list(block or [])
+    if anchor_index is None:
+        anchor_index = pick_reply_anchor(block)
+    lines = []
+    for i, it in enumerate(block):
+        text = (getattr(it, "text", "") or "").strip()
+        if not text:
+            continue
+        who = getattr(it, "who", "?")
+        prefix = ">> " if (anchor_index is not None and i == anchor_index) else ""
+        lines.append("%s%s: %s" % (prefix, who, text))
+    return "\n".join(lines), "", anchor_index
+
 
 
 def collect_default_block(snap):
@@ -111,6 +199,26 @@ def collect_default_block(snap):
     # ⚠️ 同 `collect_visible_block`：**最后一条是自己发的也照常生成**
     #    （2026-10-13 用户要求 —— 可以“跟着自己的话说”）。
     return [last], msgs[:-1], "可见的最后一条"
+
+
+def filter_history(items):
+    """历史里丢掉**纯占位**消息（图片 / 动画表情 / 文件 / 转账…），当前屏不动。
+
+    为什么只在历史里丢（2026-10-17 用户要求）：
+      · 历史里的 `[图片]` / `[动画表情]` 只是噪声，占条数、占字数；
+      · 而且**历史图片根本取不到像素**（`screens` 不存 rect，见已知边界 #11）——
+        留着它只会让模型以为"对方发了张图，去回它"，而它其实什么都没看到。
+
+    ⚠️ 当前屏**不能**用这个函数：那里必须保留（模型得知道对方发的是图/表情），
+       见 `render_current_block`。
+    """
+    out = []
+    for h in items or []:
+        text = (h.get("text") or "").strip()
+        if text and is_placeholder(text):
+            continue
+        out.append(h)
+    return out
 
 
 def block_to_text(block: List) -> str:

@@ -217,9 +217,22 @@ def test_reset(tmp):
     check("  （同一份配置里的调参仍然被清掉 —— 别把整层都留下）",
           st3.raw_override("ai.temperature") is None
           and st3.raw_override("ui.width") is None, repr(st3.overrides()))
-    check("RESET_KEEP 覆盖了地址/模型/Key 三样",
-          set(RESET_KEEP) == {"ai.base_url", "ai.model", "ai.api_key"},
+    check("RESET_KEEP 覆盖了地址/模型/Key/知识库开关",
+          set(RESET_KEEP) == {"ai.base_url", "ai.model", "ai.api_key",
+                              "kb.enabled"},
           repr(RESET_KEEP))
+    # ⚠️ 2026-10-17 用户问「恢复默认不删库有吗」：
+    #    库本身**从来不会被删**（`state/kb.db` 是独立文件，`reset_all()` 只清覆盖层），
+    #    但原来会把 `kb.enabled` 关掉 → 表现成"资料还在、回复里没它了"。
+    #    现在开关也进 RESET_KEEP，所以这两条一起守。
+    st4 = make_store(os.path.join(tmp, "d"),
+                     settings=json.dumps({"kb": {"enabled": True},
+                                          "kb.top_k": 5}))
+    st4.reset_all()
+    check("reset_all **不动**知识库开关（库还在，就不该把它关掉）",
+          st4.raw_override("kb.enabled") is True, repr(st4.overrides()))
+    check("  （知识库的调参照常清掉）", st4.raw_override("kb.top_k") is None,
+          repr(st4.overrides()))
     check("确认框文案里点名了这几样（用户得知道什么不会动）",
           "接口地址" in RESET_KEEP_LABEL and "模型" in RESET_KEEP_LABEL
           and "API Key" in RESET_KEEP_LABEL, RESET_KEEP_LABEL)

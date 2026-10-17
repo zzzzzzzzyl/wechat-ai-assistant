@@ -263,6 +263,76 @@ def test_self_last_not_blocked():
     check("只有空白文本 -> 也算无消息", b4 == [] and w4 == "无消息", w4)
 
 
+def test_reply_anchor():
+    """⚠️ 2026-10-17：回复锚点 = 最后一条「**别人**」的正文。
+
+    用户反馈「明明有上下文，它只盯着最后一两条无关紧要的说」。起因是
+    "整屏都算要回复的"，而末尾常是 `[图片]` / 我自己刚补的一句 / 语气词。
+    锚点只认 `is_self is False` 的正文，并在 prompt 里用 `>> ` 标出来
+    （见 `context.pick_reply_anchor` / `render_current_block`）。
+    """
+    print("\n6c. 回复锚点：最后一条「别人」的正文（不是最后一条）")
+    from wechat_assistant.context import (filter_history, is_dialogue,
+                                          pick_reply_anchor, render_current_block)
+    from wechat_assistant.textfilter import is_placeholder
+
+    def pic(text="[图片]"):
+        return MessageItem(text=text, cls="mmui::ChatImageItemView", is_self=False)
+
+    block = [msg("在吗", is_self=False, y=0),
+             msg("在的", is_self=True, y=100),
+             msg("你昨天为什么不回我", is_self=False, y=200),
+             pic()]
+    check("图片不算对话", not is_dialogue(block[-1]))
+    a = pick_reply_anchor(block)
+    check("锚点跳过图片，落在最后一条别人的正文上", a == 2, str(a))
+
+    # 最后一条是「我」—— 锚点要往前找，否则和规则 6（我: 不是待回复）打架
+    block2 = [msg("你昨天为什么不回我", is_self=False, y=0),
+              msg("在忙啊", is_self=True, y=100)]
+    check("最后一条是「我」-> 锚点往前找别人的那条",
+          pick_reply_anchor(block2) == 0, str(pick_reply_anchor(block2)))
+
+    # 全是我 / 全是图片 -> 没有锚点（**不伪造**：由 prompt 提示"接着自己的话说"）
+    check("全是「我」-> 没有锚点",
+          pick_reply_anchor([msg("嗯", True), msg("好", True)]) is None)
+    check("全是图片 -> 没有锚点", pick_reply_anchor([pic(), pic()]) is None)
+
+    text, nont, idx = render_current_block(block)
+    check("锚点行用 >> 标出", ">> 对方: 你昨天为什么不回我" in text, text)
+    # ⚠️ 2026-10-17 用户要求：**当前屏的图片/表情要指出来**（留在原位），
+    #    只是不让它当锚点 —— 所以这里断言"保留"，不是"被挪走"。
+    check("图片**保留**在对话行（当前屏要指出来）", "[图片]" in text, text)
+    check("非文字说明现在是空的（留给将来）", nont == "", repr(nont))
+    check("对话行数 = 有文本的消息数", len(text.splitlines()) == 4,
+          str(text.splitlines()))
+    check("锚点下标原样返回（给调用方看/打日志）", idx == 2, str(idx))
+
+    # 动画表情：UIA 里是 **kind=text**、文本为「动画表情」—— 只判 kind 会漏
+    emoji = msg("动画表情", is_self=False, y=300)
+    check("动画表情不算对话（kind 是 text，靠占位文本判）",
+          not is_dialogue(emoji), "应判 False")
+    block3 = [msg("在吗", is_self=False, y=0), emoji]
+    check("锚点不会落在动画表情上", pick_reply_anchor(block3) == 0,
+          str(pick_reply_anchor(block3)))
+    text3, _n3, _i3 = render_current_block(block3)
+    check("动画表情**保留**在当前屏（指出来）", "动画表情" in text3, text3)
+
+    # 历史：纯占位**不计入**；真人说的话里带同样的词不受影响
+    hist = [{"who": "对方", "text": "在吗"},
+            {"who": "对方", "text": "[图片]"},
+            {"who": "对方", "text": "动画表情"},
+            {"who": "对方", "text": "这个图片很好看"},
+            {"who": "", "text": "……中间有一段没读到，别硬接……"}]
+    kept = filter_history(hist)
+    check("历史里的 [图片] / 动画表情被丢掉",
+          [h["text"] for h in kept] ==
+          ["在吗", "这个图片很好看", "……中间有一段没读到，别硬接……"],
+          str([h["text"] for h in kept]))
+    check("占位判断是整串相等，不误伤真人话",
+          (not is_placeholder("这个图片很好看")) and is_placeholder("[动画表情]"))
+
+
 def test_merge():
     print("\n5. 窗口可见历史 + 库里历史 的拼接")
     stored = [{"who": "我", "text": "库里1"}, {"who": "对方", "text": "库里2"},
@@ -343,6 +413,7 @@ def main():
     test_anchor()
     test_block()
     test_self_last_not_blocked()
+    test_reply_anchor()
     test_merge()
     test_ai_contamination()
     print("\n" + "=" * 76)

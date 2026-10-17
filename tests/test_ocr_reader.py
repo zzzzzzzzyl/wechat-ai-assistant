@@ -105,7 +105,7 @@ def test_pick_window():
     cfg = FakeCfg(**{"wechat.window_title": "微信"})
 
     one = [{"hwnd": 1, "title": "微信"}]
-    check("只有一个候选 -> 用它（不管标题）",
+    check("只有一个候选、标题是主窗口名 -> 用它",
           pick_window(one, cfg) is one[0])
 
     multi = [{"hwnd": 1, "title": "图片和视频"},
@@ -127,6 +127,27 @@ def test_pick_window():
     check("**分不出来时返回 None**（宁可不读也不瞎读）",
           pick_window(no_main, cfg) is None)
     check("空列表返回 None", pick_window([], cfg) is None)
+
+    # ⚠️ 2026-10-17：打开「图片和视频」预览时，它**可能也叫「微信」**。
+    #    纯 Win32 的补充判据：没有 WS_CAPTION 的是无边框弹窗，不是主窗口。
+    import win32con
+    both = [{"hwnd": 1, "title": "微信", "style": win32con.WS_CAPTION, "owner": 0},
+            {"hwnd": 2, "title": "微信", "style": 0, "owner": 0}]
+    got3 = pick_window(both, cfg)
+    check("同名两个候选 -> 排除没有 WS_CAPTION 的（图片预览）",
+          got3 is not None and got3["hwnd"] == 1,
+          "拿到 %s" % (got3 or {}).get("hwnd"))
+
+    owned = [{"hwnd": 1, "title": "微信", "style": win32con.WS_CAPTION, "owner": 5},
+             {"hwnd": 2, "title": "微信", "style": win32con.WS_CAPTION, "owner": 0}]
+    got4 = pick_window(owned, cfg)
+    check("同名 -> 排除有 owner 的（弹窗挂在主窗口下）",
+          got4 is not None and got4["hwnd"] == 2,
+          "拿到 %s" % (got4 or {}).get("hwnd"))
+
+    only_pic = [{"hwnd": 1, "title": "图片和视频"}]
+    check("单候选但标题不是主窗口名 -> None（等主窗口，别把图片窗口当聊天）",
+          pick_window(only_pic, cfg) is None)
 
 
 # ============================================================ 2. 聊天区几何

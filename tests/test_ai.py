@@ -211,7 +211,7 @@ def test_build_prompts_appends_format():
           "重复了" if "【输出格式】只输出 JSON" in system else "")
     check("【输出要求】来自代码侧的 OUTPUT_SPEC", OUTPUT_SPEC[:20] in system)
     check("user 里有对话历史和要回复的那段",
-          "【对话历史】" in user and "要回复的就是这一段" in user)
+          "【对话历史】" in user and "【当前屏幕上的对话】" in user)
 
     # ⚠️⚠️ **用户把提示词框改成什么都没关系** —— 输出格式照样在。
     #    这正是"挪到代码侧"要买的东西：改坏提示词**不会**让解析失败。
@@ -301,19 +301,31 @@ def test_reply_target_wording():
     ai = AIClient(cfg)
     _, user = ai.build_prompts("人设", [], g, 3)
     check("标题如实描述（不再是「需要回复的最新消息」）",
-          "需要回复的最新消息" not in user and "要回复的就是这一段" in user)
-    check("明确说了「最后一条是最新的」", "最后一条是最新的" in user)
+          "需要回复的最新消息" not in user and "【当前屏幕上的对话】" in user)
+    check("没标 >> 时提示「这一屏没有别人的正文」",
+          "没有别人发的正文" in user)
     check("有「群友」时给出警告：它们不一定是同一个人",
           "不一定是同一个人" in user)
+
+    # ⚠️ 2026-10-17：真正要回的那条由 `>> ` 标出（`context.render_current_block`）。
+    #    用户反馈「只盯着最后一两条无关紧要的」，所以要断言：① 标记含义被解释；
+    #    ② 不会再说「最后一条是最新的」（那句等于叫模型只回最后一条）。
+    anchored = ("我: 在忙啊\n>> 对方: 你昨天为什么不回我消息\n"
+                "对方: 算了 你爱怎么想怎么想吧")
+    _, user1b = ai.build_prompts("人设", [], anchored, 3)
+    check("带 >> 时说明那一条才是要回应的",
+          "标着 >> " in user1b and "这次要回应" in user1b)
+    check("明确要求「看懂整段再回」，不是只抓最后一句",
+          "别只抓最后一句" in user1b)
+    check("不再出现「最后一条是最新的」", "最后一条是最新的" not in user1b)
 
     _, user2 = ai.build_prompts("人设", [], "对方: 在吗", 3)
     check("块里没有「群友」时**不加**那句警告（省 token）",
           "不一定是同一个人" not in user2)
-    check("但标题和「最后一条」那句永远有",
-          "要回复的就是这一段" in user2 and "最后一条是最新的" in user2)
+    check("标题永远有（不依赖群聊）", "【当前屏幕上的对话】" in user2)
 
     _, user3 = ai.build_prompts("人设", [], "", 3)
-    check("current 为空时不拼那段标题", "要回复的就是这一段" not in user3)
+    check("current 为空时不拼那段标题", "【当前屏幕上的对话】" not in user3)
 
 
 def main():

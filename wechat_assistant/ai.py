@@ -286,7 +286,7 @@ class AIClient:
             if dropped and not rows:
                 return "（历史太长，按长度上限全部略去）"
 
-        lines = ["%s: %s" % (w, t) for w, t in rows]
+        lines = [("%s: %s" % (w, t)) if w else "（%s）" % t for w, t in rows]
         return "\n".join(lines) if lines else "（暂无历史）"
 
     def build_prompts(self, persona: str, history: List[dict], current: str,
@@ -354,9 +354,20 @@ class AIClient:
         #       除非回复目标的取法也一起改成"只取最后一条"。
         _blk = (current or "").strip()
         if _blk:
-            head = ("\n【当前屏幕上的对话 —— 要回复的就是这一段】\n" + _blk
-                    + "\n\n（**最后一条是最新的**；前面几条是刚发生的背景，"
-                      "一起看再回，别只盯着最后一条。）")
+            # ⚠️⚠️ 2026-10-17 **改标题**（用户反馈：明明有上下文，它只盯着最后一两条
+            #    无关紧要的说）。旧标题是「当前屏幕上的对话 —— 要回复的就是这一段」，
+            #    等于要求模型对**整屏每一行**都回应；而实测当前屏常常只有 2-5 条、
+            #    一半是 `[图片]`、末尾还是我自己刚说的话（`probes/diag_context_focus.py`）。
+            #    现在真正要回的那条由 `run_watch` 用 `>> ` 标出来
+            #    （见 `context.render_current_block` / `pick_reply_anchor`），
+            #    这里只解释标记的含义。
+            has_anchor = any(l.startswith(">> ") for l in _blk.splitlines())
+            head = "\n【当前屏幕上的对话】\n" + _blk + "\n\n"
+            if has_anchor:
+                head += ("（标着 >> 的那条是**这次要回应的**；它后面的是紧接着的补充，"
+                         "前面几条是同一段对话的背景 —— 看懂整段再回，别只抓最后一句。）")
+            else:
+                head += ("（这一屏没有别人发的正文消息 —— 可以顺着我们自己刚才那句话往下说。）")
             # ⚠️ 群聊里认不出昵称的成员显示成「群友」—— **它们不一定是同一个人**。
             #    不说明的话模型会把 `群友: A` / `群友: B` 当成同一人的两句话，
             #    写出来的回复张冠李戴（用户实测就是这个场景：

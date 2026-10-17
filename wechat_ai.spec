@@ -106,6 +106,17 @@ hiddenimports = [
     #    漏掉的症状很隐蔽：**打包后第二次双击 exe 什么都不发生**
     #    （单实例判不出来 = 又开一个，或者唤不出原窗口），而不是报错。
     "wechat_assistant.single_instance",
+    # ⚠️ 2026-10-17：知识库是**懒加载**的（`run_watch.main` 里 `if kb.enabled` 才 import，
+    #    `settings_ui._kb()` 里也是函数内 import）—— 静态分析可能看不全。
+    #    漏掉的症状：**打包版一打开知识库分组就报错 / 生成时静默没有参考资料**。
+    "wechat_assistant.kb",
+    # ⚠️ 2026-10-17：知识库支持 PDF / Word，但这两个库是**在函数里懒加载**的
+    #    （`kb.read_pdf` / `kb.read_docx` 里 import），静态分析看不到。
+    #    漏掉的症状：打包版"添加 PDF"时抛 ImportError，而源码版一切正常。
+    "fitz",            # PyMuPDF（PDF 抽文字）
+    "docx",            # python-docx（Word 段落 + 表格）
+    "lxml",
+    "lxml.etree",
     # ⚠️ 标题栏那颗齿轮图标是**用户给的 SVG**（`wechat_assistant/assets/gear.svg`），
     #    由 `panel._gear_pixmap()` 用 `QtSvg` 渲染。这一条是**懒加载**（函数里 import），
     #    静态分析不一定看得到；漏掉的症状很隐蔽：**图标静默变成自绘那个**

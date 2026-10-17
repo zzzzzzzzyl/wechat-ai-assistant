@@ -113,8 +113,8 @@ from wechat_assistant import paths
 from wechat_assistant.config import ConfigError, load_config, resolve_state_path
 from wechat_assistant.context import (block_to_dicts, block_to_text, collect_default_block,
                                       collect_target_block, collect_visible_block,
-                                      find_anchor, history_to_dicts,
-                                      merge_with_store)
+                                      filter_history, find_anchor, history_to_dicts,
+                                      is_dialogue, merge_with_store, render_current_block)
 from wechat_assistant.reader import WeChatReader
 from wechat_assistant.sessions import SessionRegistry, merge_known_sessions
 from wechat_assistant.uia_worker import UiaError, UiaWorker
@@ -227,6 +227,53 @@ def get_relationship(cfg, session_key: str) -> str:
     if isinstance(per, dict) and per.get(session_key):
         return per[session_key]
     return cfg.get("persona.default_relationship", "") or ""
+
+
+def _kb_query(current_text: str, user_intent: str = "") -> str:
+    """拿什么去知识库里查。
+
+    ⚠️ **不用整段历史**：历史是"更早的话题"，拿它去查会把无关内容的片段检索进来。
+    优先级（`RAG调研.md` §5.4）：
+        ① 「我想说」—— 用户已经把他关心什么说出来了，最准；
+        ② 当前屏上标着 `>>` 的那条（这次要回应的）；
+        ③ 当前屏最后两条别人的正文（去掉 `>>` 前缀）。
+
+    返回 "" = 这次不检索（由调用方跳过）。
+    """
+    parts = []
+    intent = (user_intent or "").strip()
+    if intent:
+        parts.append(intent)
+
+    def _strip_who(s: str) -> str:
+        """去掉 `谁：内容` 里的说话人。
+
+        ⚠️ 检索时"客户:"这种前缀是纯噪声（资料里不会写"客户:"），而且
+            `客户` 这两个字会和资料里的"客户"撞上 —— 实测会把无关片段捞上来。
+        """
+        s = s.strip()
+        for sep in ("：", ": "):
+            if sep in s:
+                head, tail = s.split(sep, 1)
+                if head and len(head) <= 12 and " " not in head:
+                    return tail.strip()
+        return s
+
+    anchor = ""
+    tail = []
+    for line in (current_text or "").splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        if s.startswith(">>"):
+            anchor = _strip_who(s[2:].strip())
+            continue
+        tail.append(_strip_who(s))
+    if anchor:
+        parts.append(anchor)
+    # 最后两条（锚点之后往前数的补充内容）
+    parts.extend([s for s in tail[-2:] if s])
+    return " ".join(p for p in parts if p)[:200]
 
 
 def install_sigint_handler(ui, log):
@@ -486,6 +533,45 @@ def main():
             log("屏快照库不可用，退回 messages 顺序: %s: %s" % (type(e).__name__, e))
             screens = None
 
+    # ---------- 知识库（2026-10-17）
+    #
+    # ⚠️ **按需创建，不是启动时一锤定音**（2026-10-17 用户实测踩到）：
+    #    原来只在启动那一刻 `if kb.enabled` 才建 —— 结果用户在设置里打开开关后
+    #    **不重启就不检索**，而且界面上那个开关没标"需重启"（配置项是自动保存的），
+    #    完全看不出来。现在改成 `ensure_kb()`：生成前调一次，第一次真要用时才建。
+    # ⚠️ 库打不开**不影响生成**：置 None，生成路径每处都判它，退化成"没有资料"。
+    # ⚠️ 这里**不需要单例**：`KnowledgeBase` 每次操作自己开/关 sqlite 连接，
+    #    不持有状态，所以设置窗口那份和这里这份同时存在也没冲突（WAL 模式）。
+    kb = None
+
+    def ensure_kb():
+        """要用知识库的时候才建（`kb.enabled` 关着就直接返回 None）。"""
+        nonlocal kb
+        if kb is not None or not cfg.get("kb.enabled", False):
+            return kb
+        try:
+            from wechat_assistant.kb import KnowledgeBase
+
+            kb = KnowledgeBase(
+                path=paths.resolve(cfg.get("kb.path", "state/kb.db")),
+                chunk_chars=int(cfg.get("kb.chunk_chars", 400) or 400),
+                # 扫描件 PDF 要不要 OCR 兜底（**默认关**：有文字层的 PDF 不需要它）
+                ocr_pdf=bool(cfg.get("kb.ocr_pdf", False)),
+                logger=log)
+            _s = kb.summary()
+            if _s["docs"]:
+                log("知识库: %d 份资料 / %d 段 / %d 千字"
+                    % (_s["docs"], _s["chunks"], max(1, _s["chars"] // 1000)))
+            else:
+                log("知识库已启用，但还没有导入资料（设置 → 知识库）")
+        except Exception as e:
+            log("知识库不可用（回复时不会有参考资料）: %s: %s"
+                % (type(e).__name__, e))
+            kb = None
+        return kb
+
+    ensure_kb()          # 启动时先试一次，日志里能看到库的规模
+
     # ---------- 静默记录：把对话记全（**只写库，不调 AI、不提醒**）
     #
     # 为什么要有它：在此之前 save_messages() 只在 do_generate() 里调用，
@@ -503,13 +589,27 @@ def main():
             recorder = None
 
     # ---------- 找窗口（自检）
+    #
+    # ⚠️ 2026-10-17：**找不到不退出**（用户要求「不应该停止，而是在一边检测等候」）。
+    #    以前这里直接 `return 4`：微信还没启动 / 还没登录时双击程序 = 闪退，
+    #    用户不知道发生了什么。
+    #    ⚠️ 等待**不能在这里用 `time.sleep` 阻塞** —— 这时 `ui.run()`（Qt 事件循环）
+    #       还没开始，界面根本不会显示，打包版看起来像没启动。
+    #       真正的等待在下面：有界面时用 **QTimer**（界面底部显示进度），
+    #       没界面（`--no-ui`）才退回阻塞等待。
+    #    ⚠️ `--once` / `--demo` 是"跑一轮就退出"的工具模式，**保持原样**
+    #       （脚本要能立刻以 4 退出，不能挂住）。
     win = reader.find_window()
-    if not win:
+    if not win and (args.once or args.demo):
         log("找不到微信主窗口。请确认微信已启动并登录。")
         close_worker()
         return 4
-    hwnd = win["hwnd"]
-    log("找到微信窗口: hwnd=%s pid=%d" % (hex(hwnd), win["pid"]))
+    if win:
+        hwnd = win["hwnd"]
+        log("找到微信窗口: hwnd=%s pid=%d" % (hex(hwnd), win["pid"]))
+    else:
+        hwnd = 0
+        log("还没找到微信主窗口 —— 先建界面等待（打开微信后会自动继续）")
 
     # ---------- 悬浮窗
     ui = None
@@ -524,6 +624,16 @@ def main():
         registry.set_mode(key, str(mode))
         registry.save()
         log("会话「%s」的模式改为 %s（已生效，不用重启）" % (key, mode))
+
+    def on_kb_change(key, on):
+        """会话面板里点了「用知识库」—— 写回注册表并落盘。
+
+        ⚠️ 和模式一样**立即生效**（不重启、也不按保存）：那个开关在界面上就是
+        一个独立的开关，点了却没反应是最烦的体验。
+        """
+        registry.set_kb_enabled(key, bool(on))
+        registry.save()
+        log("会话「%s」的知识库：%s（已生效）" % (key, "开" if on else "关"))
 
     def on_config_changed(new_cfg):
         """设置窗口保存后，把新配置接过来并**重读那些启动时缓存过的值**。
@@ -550,6 +660,12 @@ def main():
             log("配置已重新加载（AI 参数、上下文长度、会话级人设/关系立即生效）")
         except Exception as e:
             log("重建 AI 客户端失败（沿用旧的）: %s: %s" % (type(e).__name__, e))
+        # ⚠️ 知识库同理：**刚在设置里打开的开关要立刻生效**（不然只有生成前那次
+        #    `ensure_kb()` 兜着，日志里要等到下一次生成才看得到库的规模）。
+        try:
+            ensure_kb()
+        except Exception as e:
+            log("重读知识库失败: %s: %s" % (type(e).__name__, e))
 
     if not args.no_ui:
         # 界面只有一套：`wechat_assistant/qt_ui/`（PySide6，无边框 + 真圆角抗锯齿）。
@@ -604,6 +720,8 @@ def main():
                 #    见上面那段说明。
                 session_source=_session_source,
                 on_mode_change=on_mode_change,
+                kb=kb,
+                on_kb_change=on_kb_change,
                 on_config_changed=on_config_changed,
             )
         except Exception as e:
@@ -895,6 +1013,7 @@ def main():
             #   messages（旧）: 可见历史 + 库里最近 N 条，按重叠点合并。
             max_ctx = ai.max_messages if ai is not None else 20
             history = None
+            gap_seen = False
             if screens is not None:
                 key = registry.key_for(sess)
                 items, gap = screens.stitch(
@@ -904,18 +1023,44 @@ def main():
                     cut_at_date=bool(cfg.get("reply.cut_at_date", True)))
                 if items:
                     history = to_prompt_dicts(items)
+                    # ⚠️ 2026-10-17：历史里**不计入纯占位**（图片 / 动画表情 / 文件…）。
+                    #    当前屏反过来 —— 保留并指出来（见 `render_current_block`）。
+                    history = filter_history(history)
                     # 把「回复目标」那几条从历史里去掉：它们在 prompt 里另有位置，
                     # 留着会重复一遍（block 就是当前屏幕上的对话）
+                    #
+                    # ⚠️ 2026-10-17：**从当前屏的最后一条正文往前找**，不是第一条。
+                    #    第一条常常是 `[图片]` / `嗯` / `好的` 这种重复文本，
+                    #    按它匹配会命中历史里更早的同一条 → 历史被砍太短
+                    #    （实测 40 屏的会话只剩 11 条，见 `probes/diag_context_focus.py`）。
                     try:
-                        first = block_to_dicts(block)[0]["text"]
-                        for i in range(len(history) - 1, -1, -1):
-                            if history[i]["text"] == first:
-                                history = history[:i]
+                        tail = ""
+                        for it in reversed(block):
+                            if is_dialogue(it):
+                                tail = (getattr(it, "text", "") or "").strip()
                                 break
+                        first = (block_to_dicts(block) or [{}])[0].get("text") or ""
+                        cut_at = None
+                        for cand in (tail, first):
+                            if not cand:
+                                continue
+                            for i in range(len(history) - 1, -1, -1):
+                                if history[i]["text"] == cand:
+                                    cut_at = i
+                                    break
+                            if cut_at is not None:
+                                break
+                        if cut_at is not None:
+                            history = history[:cut_at]
                     except Exception:
                         pass
                     if gap:
                         log("屏快照：缝合时有屏接不上（中间可能有没看到的内容）")
+                        # ⚠️ 2026-10-17：**断口要告诉模型**，不能只写日志。
+                        #    只写日志的话，模型会把断口两侧硬接成连续对话。
+                        #    ⚠️ 标记**不能在这里插** —— 下面 `history[-max_ctx:]`
+                        #       会把它切掉（它在队首）。统一在截断之后插。
+                        gap_seen = True
                     # 切段是**有意为之**，别让它静默发生 —— 用户得知道
                     # "为什么这次的历史比上次短"
                     if items and is_time_item(items[0]) and items[0].get("date"):
@@ -932,10 +1077,28 @@ def main():
                                                         int(cfg.get("reply.history_messages", 40)))]
                 history = merge_with_store(visible_history, stored, max_ctx)
             else:
-                history = history[-max_ctx:]
+                # ⚠️ 断口标记要**算在 max_ctx 里面**：`render_history` 还会再取一次
+                #    「最近 20 条」，插在队首的标记会被切掉 → 等于没提示。
+                if gap_seen and history:
+                    history = history[-(max_ctx - 1):] if len(history) >= max_ctx \
+                        else history
+                    history.insert(0, {"who": "",
+                                       "text": "……中间有一段没读到，别硬接……"})
+                else:
+                    history = history[-max_ctx:]
 
-            current_text = "\n".join(
-                "%s: %s" % (m.get("who"), m.get("text")) for m in block_to_dicts(block))
+            # ⚠️ 2026-10-17：**标出真正要回的那条**（`>> `）。
+            #    用户反馈「明明有上下文，它只盯着最后一两条无关紧要的说」——
+            #    原因是"整屏都算要回复的"，而末尾常是我自己的话 / `[图片]`。
+            #    锚点规则：最后一条**别人**的正文（`pick_reply_anchor`）；
+            #    图片 / 动画表情**保留**在对话行里（要"指出来"），但不作锚点。
+            dia, _nont, _anchor = render_current_block(block)
+            if dia:
+                current_text = dia
+            else:
+                # 整屏全是占位（一句正文都没有）：保留原文，否则模型看不到这一屏
+                current_text = "\n".join(
+                    "%s: %s" % (m.get("who"), m.get("text")) for m in block_to_dicts(block))
             target_preview = block_to_text(block)
 
             # 把「程序理解的目标」交给悬浮窗显示 —— 取错了一眼能发现
@@ -1015,10 +1178,47 @@ def main():
                 log("关系设定: %s" % relationship)
             if user_intent:
                 log("你说要表达的意思: %s" % user_intent)
+            # ---- 知识库检索（2026-10-17）
+            #
+            # ⚠️ **纯本地、0.2ms、不加一次请求** —— 查到的片段拼进**同一次**调用的
+            #    user prompt（`ai.build_prompts` 的 `extra_context`）。
+            # ⚠️ 三道闸，任何一道不过就**完全不拼**（连【参考资料】标题都不出现）：
+            #    ① 总开关关 / 这个会话没开 → 连查询词都不拼；
+            #    ② 查询清洗后为空 / 0 结果 → 跳过；
+            #    ③ 异常 → 打一行日志 + 当没查到（**不许让生成失败**）。
+            extra_context = ""
+            _kb = ensure_kb()          # ⚠️ 按需创建：设置里刚打开的开关**不用重启就生效**
+            if _kb is not None and cfg.get("kb.enabled", False):
+                if registry.kb_enabled(sess):
+                    try:
+                        _q = _kb_query(current_text, user_intent)
+                        if _q:
+                            extra_context = _kb.render(
+                                _q,
+                                top_k=int(cfg.get("kb.top_k", 3) or 3),
+                                min_ratio=float(cfg.get("kb.min_ratio", 0.6) or 0.6),
+                                max_chars=int(cfg.get("kb.max_chars", 600) or 600))
+                            if extra_context:
+                                # ⚠️ 日志里要能看出**几条**：这是测试时唯一的判据
+                                #    （OR 查询几乎不会 0 结果，所以"有没有【参考资料】"
+                                #     判断不出命中好坏，得看条数和查询词）。
+                                log("[KB] 命中 %d 条，进 prompt %d 字（查询：%s）"
+                                    % (extra_context.count("【资料 "),
+                                       len(extra_context), _q[:40]))
+                            else:
+                                log("[KB] 没查到相关的资料，这次不带参考资料")
+                    except Exception as e:
+                        # ⚠️ 像 bug 的异常要打调用栈，别让"知识库静默不工作"变成悬案
+                        extra_context = ""
+                        log("[KB] 检索失败（当作没查到）: %s: %s"
+                            % (type(e).__name__, e))
+                else:
+                    log("[KB] 这个会话没开知识库（会话面板里可以打开）")
             try:
                 # ⚠️ 图片只有 `ocr_read.attach_image` 打开时才会有
                 #    （见 `OcrReader._crop_images`）；关着时 `snap.images` 恒为空。
                 replies = ai.generate_replies(persona, history, current_text,
+                                              extra_context=extra_context,
                                               style_samples=samples,
                                               relationship=relationship,
                                               user_intent=user_intent,
@@ -1128,13 +1328,92 @@ def main():
 
     # ---------- 触发源
     trigger = None
+    trigger_started = False
     if cfg.get("trigger.enabled", True):
         from wechat_assistant.trigger import TriggerManager
 
         trigger = TriggerManager(cfg, reader, logger=log, on_trigger=on_trigger)
-        trigger.start(hwnd)
+        if hwnd:
+            trigger.start(hwnd)
+            trigger_started = True
+        else:
+            # 2026-10-17：窗口还没出现 -> 热键等窗口出现后再挂（见下面的等待段）
+            log("触发源还没挂：等微信窗口出现后再注册热键")
     else:
         log("触发源已关闭（trigger.enabled=false）")
+
+    # ---------- 等微信窗口（打包版没有控制台 -> 显示在界面底部）
+    #
+    # ⚠️ 2026-10-17（用户要求）：打包版双击时如果微信还没开/没登录，
+    #    不能"闪退"也不能干等 —— 界面底部显示「等待微信窗口打开…」，
+    #    窗口出现后自动清掉，并把热键挂上、记录器自动接上（它每拍自己找窗口）。
+    #
+    # ⚠️ 必须用 **QTimer** 而不是 `sleep` 循环：`ui.run()`（Qt 事件循环）
+    #    还没开始，阻塞在这里界面根本不会显示 —— 打包版看起来像没启动。
+    #    `--no-ui` 没有事件循环，才退回阻塞等待。
+    wait_timer = None
+    if not win:
+        if ui is not None:
+            from PySide6 import QtCore
+
+            wait_n = {"n": 0}
+
+            def _wait_tick():
+                nonlocal win, hwnd, trigger_started
+                wait_n["n"] += 1
+                w = reader.find_window()
+                if w:
+                    win, hwnd = w, w["hwnd"]
+                    log("微信窗口出现了: hwnd=%s pid=%d" % (hex(hwnd), w["pid"]))
+                    if wait_timer is not None:
+                        wait_timer.stop()
+                    if trigger is not None and not trigger_started:
+                        trigger.start(hwnd)
+                        trigger_started = True
+                    # ⚠️ 主题是启动时定的，而那时可能还没窗口（= 退到了系统主题）。
+                    #    窗口出现了要**重采一次**，否则一直停在系统主题上
+                    #    （2026-10-17 用户报：日志永远「采样不到微信窗口」）。
+                    try:
+                        ui.set_theme()
+                    except Exception as e:
+                        log("窗口出现后重采主题失败: %s: %s" % (type(e).__name__, e))
+                    try:
+                        ui.post_status("")
+                    except Exception:
+                        pass
+                    return
+                # 每 10 秒记一行日志（既给日志，也给"界面在动"的证据）
+                if wait_n["n"] % 10 == 0:
+                    log("等待微信主窗口…（已检查 %d 次）" % wait_n["n"])
+                try:
+                    ui.post_status("等待微信窗口打开…（已等 %d 秒）" % wait_n["n"])
+                except Exception:
+                    pass
+
+            wait_timer = QtCore.QTimer(ui)
+            wait_timer.timeout.connect(_wait_tick)
+            wait_timer.start(1000)      # 1 秒一跳；界面不卡、状态行在动
+            try:
+                ui.post_status("等待微信窗口打开…")
+            except Exception:
+                pass
+            log("等待微信主窗口…（界面底部会显示；打开微信后自动继续）")
+        else:
+            try:
+                while not win:
+                    log("等待微信主窗口…（请打开微信并登录；Ctrl+C 退出）")
+                    time.sleep(2)
+                    win = reader.find_window()
+            except KeyboardInterrupt:
+                # ⚠️ 这里在 `try/finally` 主循环**之前**，Ctrl+C 不会走那边的清理
+                log("收到 Ctrl+C，退出")
+                close_worker()
+                return 0
+            hwnd = win["hwnd"]
+            log("微信窗口出现了: hwnd=%s pid=%d" % (hex(hwnd), win["pid"]))
+            if trigger is not None and not trigger_started:
+                trigger.start(hwnd)
+                trigger_started = True
 
     # ---------- 立即触发一次（验证链路用，注意要放在 trigger 初始化之后）
     if args.demo:

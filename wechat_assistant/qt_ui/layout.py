@@ -443,11 +443,19 @@ class ShellDialog(QtWidgets.QDialog):
         return lab
 
     def add_button(self, text: str, variant: str = "ghost", on_click=None,
-                   close: bool = True):
+                   close: bool = True, accept: bool = True):
         """往右下角加一颗按钮（顺序是从左往右）。
 
         ⚠️ 默认样式跟设置窗口底部那排保持一致：
            次要 `ghost`（取消/关闭）、主要 `primary`（确定/保存）。
+
+        ⚠️⚠️ **「取消」必须传 `accept=False`**（2026-10-17 血案）：
+            原来这里**无论点哪颗都调 `self.accept()`**，于是
+            `dlg.exec() == Accepted` 恒为真 —— **点「取消」等于点「确定」**：
+              · 确认框（移除资料 / 删除分组 / 恢复默认）→ 点取消照样执行删除；
+              · 输入框（新建分组）→ 点取消拿回空名字，然后弹一个"组名不能为空"的错。
+            症状是"取消没反应/反而做事了"，而单测全绿（测试里关了弹窗，走不到这条路）。
+            现在：`accept=False` → `reject()`，`exec()` 返回 `Rejected`。
         """
         from .widgets import Pill      # 放在函数里：避免模块级循环引用
 
@@ -455,7 +463,10 @@ class ShellDialog(QtWidgets.QDialog):
             if on_click is not None:
                 on_click()
             if close:
-                self.accept()
+                if accept:
+                    self.accept()
+                else:
+                    self.reject()
         b = Pill(self.style, text, _go, variant=variant, parent=self)
         self.foot.addWidget(b, 0, QtCore.Qt.AlignVCenter)
         return b
