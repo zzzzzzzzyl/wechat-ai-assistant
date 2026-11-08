@@ -173,6 +173,9 @@ class Style:
 
     def __init__(self, cfg=None, hwnd: int = 0, name: Optional[str] = None,
                  logger=None):
+        #: ⚠️ `hwnd` 是**历史参数**：以前要拿它去采样微信窗口判断深浅色。
+        #:    那条链 2026-10-19 已删（见 `theme.py` 顶部），现在传什么都无所谓。
+        #:    参数留着只是为了不改几十个 `Style(cfg, 0, ...)` 调用点。
         self.scale = _SCALE
         self.theme_name = name or theme.detect(cfg, hwnd, logger)
         self.p = theme.palette(self.theme_name)

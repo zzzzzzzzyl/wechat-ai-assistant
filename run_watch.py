@@ -124,9 +124,43 @@ from wechat_assistant.window import (is_time_item, items_from_snapshot,
 
 
 def make_logger(quiet=False):
+    """控制台 + `logs/app.log` **双写**。
+
+    ⚠️ 2026-11-08：以前源码版的日志**只进控制台**（`_attach_frozen_log()` 只服务
+        打包版）。于是"点击没反应"这类问题只能靠人工去 attach 控制台取证据，
+        终端一关就什么都没了。现在一律落盘，出问题直接看 `logs/app.log`。
+
+    ⚠️ 写文件失败**绝不能影响程序**：任何异常都把文件那头关掉、继续只打控制台。
+        日志是给人排查用的，不是运行前提（打包版的 `sys.stdout` 才是前提，
+        那件事由 `_attach_frozen_log()` 保证）。
+    ⚠️ 单个文件超过 8MB 就轮转成 `app.log.1`（**只留一份**）：
+        记录器每 30 秒一行心跳，不轮转会无限长。
+    """
+    fh = None
+    try:
+        p = paths.log_path()
+        d = os.path.dirname(p)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        try:
+            if os.path.getsize(p) > 8 * 1024 * 1024:
+                os.replace(p, p + ".1")
+        except OSError:
+            pass
+        fh = open(p, "a", encoding="utf-8", errors="replace")
+    except Exception:
+        fh = None
+
     def log(msg):
+        line = "[%s] %s" % (time.strftime("%H:%M:%S"), msg)
         if not quiet:
-            print("[%s] %s" % (time.strftime("%H:%M:%S"), msg), flush=True)
+            print(line, flush=True)
+        if fh is not None:
+            try:
+                fh.write(line + "\n")
+                fh.flush()          # 卡死时也要能看到最后一句
+            except Exception:
+                pass
     return log
 
 

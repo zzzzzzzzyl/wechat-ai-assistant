@@ -669,31 +669,6 @@ class ReadWindow(ShellDialog):
 
 # ================================================================ 悬浮面板
 
-def wechat_hwnd(cfg) -> int:
-    """当前**微信主窗口**的 HWND（主题采样用）。拿不到返回 0。
-
-    ⚠️⚠️ 2026-10-17 修：原来这里所有调用点都写死 `hwnd=0` ——
-       而 `theme.detect()` 拿到 0 就**永远采样失败**，直接退系统主题。
-       于是日志里那句「主题：采样不到微信窗口（可能最小化）」**一直都在**，
-       用户看到的就是"主题根本不跟微信，只跟系统"（他报的正是这个）。
-
-    ⚠️ 用 `winlocate.find_main_hwnd()`（纯 Win32，和读取/跟随**同一套判据**），
-       不 import uiautomation —— 这个函数在 `Style` 构造时就会调，
-       不能有 provider 卡死风险。
-    """
-    try:
-        import os
-        # offscreen（测试/无桌面）下没有真实微信窗口可采 —— 直接 0，
-        # 免得测试去依赖桌面状态（否则测试跑在开了微信的机器上会飘）。
-        if os.environ.get("QT_QPA_PLATFORM", "").lower() == "offscreen":
-            return 0
-        from ..winlocate import find_main_hwnd
-
-        return find_main_hwnd(cfg)
-    except Exception:
-        return 0
-
-
 class FloatingAssistant(Panel):
     """悬浮面板：会话名 + 三条建议 + 「我想说」 + 生成按钮。
 
@@ -741,7 +716,7 @@ class FloatingAssistant(Panel):
         #    `init_app()` 内部走 `instance() or QApplication(...)`，重复调是安全的。
         init_app([])
 
-        style = Style(cfg, wechat_hwnd(cfg), logger=self._log)
+        style = Style(cfg, logger=self._log)
         radius = style.px(int(cfg.get("ui.radius", theme.SHELL_RADIUS)
                               or theme.SHELL_RADIUS))
         super().__init__(style, radius=radius)
@@ -2031,15 +2006,21 @@ class FloatingAssistant(Panel):
         重建比重绘每个控件简单可靠，而界面元素很少，代价可以忽略
         （Qt 里整棵重建实测 10ms 量级，Tk 版是百毫秒级）。
 
-        ⚠️ 2026-10-17：`hwnd` 以前写死 0（`theme.detect` 永远退系统主题，
-           见 `wechat_hwnd()` 的说明）。这里只算**一次**句柄，两处都用它。
+        ⚠️ 2026-10-17：这里原来要把微信窗口句柄算出来交给 `detect()` 去**采样**
+           （否则它拿到 0 永远退系统主题）。2026-10-19 采样那条链已经删掉
+           （见 `theme.py` 顶部），句柄也就不需要了。
+        ⚠️ 2026-10-19：传 `"system"` 这类"跟随"写法时**不能**拿它当主题名往下走 ——
+           `theme.palette()` 只认 dark/light，`_norm("system")` 会落到 dark，
+           于是 `style.theme_name` 变成 "system"，后面
+           `_resample_theme_foreground` 的"变没变"判断也跟着错。交给 `detect()`。
         """
-        hwnd = wechat_hwnd(self.cfg)
-        new = name or theme.detect(self.cfg, hwnd, self._log)
+        if name is not None and theme.is_follow(name):
+            name = None          # "跟随"不是主题名，交给 detect() 去读注册表
+        new = name or theme.detect(self.cfg, logger=self._log)
         if new == self.style.theme_name:
             return
         self._log("主题切换: %s -> %s" % (self.style.theme_name, new))
-        self.style = Style(self.cfg, hwnd, name=new, logger=self._log)
+        self.style = Style(self.cfg, name=new, logger=self._log)
         # 外壳半径也要跟着新缩放重算
         self.radius = self.style.px(int(self.cfg.get("ui.radius", theme.SHELL_RADIUS)
                                         or theme.SHELL_RADIUS))
@@ -2229,7 +2210,7 @@ class FloatingAssistant(Panel):
                 self._log("回传新配置失败: %s: %s" % (type(e).__name__, e))
         # 外观：主题 + 尺寸，立即生效
         try:
-            new_theme = theme.detect(self.cfg, wechat_hwnd(self.cfg), self._log)
+            new_theme = theme.detect(self.cfg, logger=self._log)
             if new_theme != self.style.theme_name:
                 self.set_theme(new_theme)
             else:
@@ -2332,27 +2313,24 @@ class FloatingAssistant(Panel):
                 self._log("UI 处理 %r 异常: %s: %s" % (kind, type(e).__name__, e))
 
     def _resample_theme_foreground(self):
-        """自动主题：**微信在前台时**重采一次（否则 PrintWindow 会抓到全黑）。
+        """自动主题：每 ~5 秒读一次**系统**深浅色，变了就换。**不碰微信窗口。**
 
-        ⚠️ 2026-10-17 修（用户报「日志永远『采样不到微信窗口』，主题只跟系统」）：
-           `theme.sample_wechat_theme` 靠 `PrintWindow` 抓图，而 **Windows 对后台
-           窗口的 PrintWindow 会返回全黑**（实测：窗口可见、没最小化、非前台
-           → `is_blank=True`）。程序是从终端/资源管理器启动的，那一刻微信在后台
-           → 采样必然失败 → 退系统主题，而且**之后再也不重采**。
-           所以这里每 5 秒看一眼：只有当**前台就是微信主窗口**时才重采 ——
-           前台才有内容，后台重采纯属浪费一次抓图。
+        ⚠️ 2026-10-19（用户："跟随微信/跟随系统只保留一个吧，不需要冗杂"）：
+           这里原来还有一条"跟随微信"的路 —— 微信在前台时 `PrintWindow` 抓一张
+           它的位图，看实际渲染成什么颜色。那条**已整段删掉**：
+           `PrintWindow` 是同步跨进程消息，微信一不泵消息就永远不返回，
+           而这里跑在 **Qt UI 线程**上 —— 用户报的「放到后台 / 休眠后卡死」
+           就是它（`probes/probe_printwindow_hang.py` 有实测：不泵消息的窗口
+           8 秒都不返回）。主题现在只读注册表，0.1ms 级，一次窗口都不读。
+        ⚠️ 每 5 秒这一拍不能省：你在中国晚上切系统的深色模式，
+           面板要能自己跟上，而不是等重启。
         """
         try:
-            if not theme.is_auto(self.cfg.get("ui.theme", "auto")):
+            if not theme.is_follow(self.cfg.get("ui.theme", "system")):
                 return          # 用户钉死了 dark/light，不折腾
-            h = wechat_hwnd(self.cfg)
-            if not h:
-                return
-            import win32gui
-
-            if win32gui.GetForegroundWindow() != h:
-                return          # 微信不在前台 -> PrintWindow 全黑，别采
-            self.set_theme()
+            new = theme.system_theme()
+            if new != self.style.theme_name:
+                self.set_theme(new)
         except Exception as e:
             self._log("自动主题重采失败: %s: %s" % (type(e).__name__, e))
 

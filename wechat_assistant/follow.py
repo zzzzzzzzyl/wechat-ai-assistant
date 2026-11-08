@@ -47,6 +47,20 @@ LOST_AFTER = 3.0
 POS_DEADBAND = 0
 SIZE_DEADBAND = 2
 
+#: 微信从最小化 / 后台**刚恢复**时，这么多秒内**完全不动几何**（位置也不动）。
+#:
+#: ⚠️ 2026-11-08 实测（用户报「最小化或置后台回来后，点卡片和生成都没反应」）：
+#:    窗口恢复过程中 `GetWindowRect` 给出的是**中间值**（日志里 3 秒刷了 40 多条
+#:    「面板宽度自动缩到 387/393/420/466/501px」）。跟着它走 = 每拍都
+#:    `SetWindowPos` + 整棵布局重排；而 Qt 的点击是「按下时命中的控件 +
+#:    松开时还在同一个控件上」才算数 —— **中间窗口一变，这次点击就作废**。
+#:    表现就是「点了没反应，得点两下」。
+#:
+#: ⚠️ **只在"我们自己把它藏起来又露出来"之后生效**（见 `_restore_if_hid`）。
+#:    不能变成"每次检测到矩形变化就冻结" —— 那会破坏「微信窗口自己一动就
+#:    立刻恢复贴边跟随」这条用户明确要过的约定（`test_follow.py` 第 5 节钉着）。
+RESTORE_SETTLE_S = 0.45
+
 #: `ui.attach` 的三个取值（见 `config.yaml` 与 `settings.py` 的 SPEC）。
 #:
 #: ⚠️ **`dock` 和 `float` 的区别不是"跟不跟"，而是"位置从哪儿来"**：
@@ -416,6 +430,10 @@ class WindowFollower:
         self._warned_pair = None     # `_verify()` 已经报过的那一对（避免刷屏）
         self._no_room = False        # 已经提示过"两侧没空间"了吗
         self._last_note = ""         # 上一次记过的宽度提示，避免刷屏
+        #: 恢复后的"静默期"截止时刻（见 `RESTORE_SETTLE_S`）
+        self._settle_until = 0.0
+        #: `_log_throttled()` 的时间戳表（按 key 节流，**不按消息原文**）
+        self._throttle = {}
         self._fg_was = False         # 上一拍微信是不是前台
         self._z_done = False         # 这一轮层级是否已经摆好
         self.running = False
@@ -582,6 +600,11 @@ class WindowFollower:
             return
         self._restore_if_hid()
 
+        # 刚露出来的这几百毫秒**一次都别碰**：此时微信的矩形还在恢复过程里，
+        # 照着它摆会连着改几十次尺寸/位置，点击全被丢掉（见 `RESTORE_SETTLE_S`）。
+        if time.monotonic() < self._settle_until:
+            return
+
         # 层级：微信在前台时把面板插到**它正上方**。
         #
         # 不这么做的话，微信一升到前面面板就被盖住了（实测反馈"打开微信它就在底层"）。
@@ -643,6 +666,10 @@ class WindowFollower:
             return
         self._hid_by_us = False
         self.ui.show()
+        # ⚠️ 显示出来之后**先别动它**：这会儿微信窗口的矩形还在恢复过程里
+        #    （见 `RESTORE_SETTLE_S`）。清掉 `_last` 是为了静默期结束后能重摆一次。
+        self._settle_until = time.monotonic() + RESTORE_SETTLE_S
+        self._last = None
 
     def _sync_zorder(self):
         """微信在前台时，把面板插到它正上方；离开前台就什么都不做。"""
@@ -686,7 +713,9 @@ class WindowFollower:
             return None
         if avail < w:
             w = max(min_w, int(avail))
-            self._log_once("空间有限，面板宽度自动缩到 %dpx" % w)
+            # ⚠️ 用**按 key 节流**，不是按消息原文去重：宽度每次都不同
+            #    （387/393/420…），按原文去重等于没去重，3 秒能刷 40 条。
+            self._log_throttled("shrink", "空间有限，面板宽度自动缩到 %dpx" % w)
 
         fixed = int(self.cfg.get("ui.height", 0) or 0)
         if fixed > 0:
@@ -729,6 +758,19 @@ class WindowFollower:
         if getattr(self, "_last_note", "") != msg:
             self._last_note = msg
             self._log(msg)
+
+    def _log_throttled(self, key: str, msg: str, every: float = 3.0):
+        """同一条提示最多每 `every` 秒记一次（按 **key** 节流，不看消息原文）。
+
+        ⚠️ 2026-11-08：这里原来用 `_log_once()`（按原文去重）—— 宽度每个像素值
+            都算"新消息"，于是恢复动画那 3 秒里刷了 40 多条，**把真正的证据淹了**。
+            节流之后同一类提示最多每 3 秒一条，日志里一眼能看出"在抖"，而不是滚屏。
+        """
+        now = time.monotonic()
+        if now - self._throttle.get(key, 0.0) < every:
+            return
+        self._throttle[key] = now
+        self._log(msg)
 
     def _apply_pos(self, wrect):
         ui, st = self.ui, self.ui.style

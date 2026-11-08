@@ -437,6 +437,22 @@ def test_minimize():
     f._apply()
     check("恢复 -> 面板重现", ui.shown == 1, "shown=%d" % ui.shown)
 
+    # ⚠️ 2026-11-08（用户报「最小化/置后台回来后，点卡片和生成都没反应」）：
+    #    恢复那一拍**只显示、不动几何** —— 微信恢复过程中窗口矩形是中间值
+    #    （实测日志里 3 秒缩了 40 多次宽度），跟着摆等于每拍都改窗口，
+    #    而 Qt 的点击要求「按下和松开落在同一个控件上」，中间一变就作废。
+    n0 = len(ui.docked)
+    follow.is_minimized = lambda hwnd: True
+    f._apply()
+    follow.is_minimized = lambda hwnd: False
+    f._apply()
+    check("恢复当拍只显示、不重摆几何", len(ui.docked) == n0,
+          "%d -> %d" % (n0, len(ui.docked)))
+    f._settle_until = 0.0            # 模拟静默期过去
+    f._apply()
+    check("静默期过后会重新摆一次", len(ui.docked) > n0,
+          "%d -> %d" % (n0, len(ui.docked)))
+
     # 用户手动隐藏的不该被跟随器掀开
     f2, ui2 = make_follower(rect=(100, 100, 800, 700))
     ui2.visible = False

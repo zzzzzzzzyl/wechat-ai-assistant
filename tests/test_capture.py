@@ -141,10 +141,90 @@ def test_capture_robust():
             check("句柄 %s 不抛异常" % bad, False, "%s: %s" % (type(e).__name__, e))
 
 
-# ============================================================ 5. capture_mode 解析
+# ============================================================ 5. 卡住的窗口不能拖死调用方
+
+def test_hung_guard():
+    """`capture_window` 的两道保险（2026-10-19 用户报「后台/休眠后卡死」）。
+
+    `PrintWindow` 是**同步跨进程消息**、没有超时参数：目标窗口的 UI 线程不泵
+    消息时它**永远不返回**（实测 >8s）。而调用方有一个在 **Qt UI 线程**上
+    （自动主题每 5 秒重采），挂住就是整个面板假死。
+    所以这里锁三件事：① 不响应的窗口根本不试；② 万一中途卡住，按超时返回 None；
+    ③ 超时不抛异常、不阻塞调用方。
+    """
+    print("\n5. 目标窗口卡死时不拖死调用方")
+    import time as _t
+
+    from wechat_assistant import capture
+
+    real_once = capture._capture_once
+    real_resp = capture.window_responding
+    real_hung = capture._hung_until
+    try:
+        # ---- ① 窗口"不响应"：一次 PrintWindow 都不该发
+        calls = {"n": 0}
+
+        def fake_once(hwnd, flags):
+            calls["n"] += 1
+            return striped()
+
+        capture._capture_once = fake_once
+        capture.window_responding = lambda hwnd: False
+        t0 = _t.perf_counter()
+        img = capture.capture_window(1)
+        dt = _t.perf_counter() - t0
+        check("不响应的窗口返回 None", img is None)
+        check("不响应的窗口不去调 PrintWindow", calls["n"] == 0,
+              "调用了 %d 次" % calls["n"])
+        check("立刻返回（<0.2s）", dt < 0.2, "%.3fs" % dt)
+
+        # ---- ② 正常窗口：照样能拿到图（保险不能误伤好路径）
+        capture.window_responding = lambda hwnd: True
+        img = capture.capture_window(1)
+        check("响应正常时能拿到图",
+              img is not None and img.size == (200, 100),
+              str(img.size if img else None))
+
+        # ---- ③ 抓图中途卡住：看门狗超时返回 None，且不抛异常
+        def stuck(hwnd, flags):
+            _t.sleep(5.0)          # 模拟卡在 SendMessage 里
+            return striped()
+
+        capture._capture_once = stuck
+        t0 = _t.perf_counter()
+        img = capture.capture_window(1, timeout=0.2)
+        dt = _t.perf_counter() - t0
+        check("卡住时返回 None", img is None)
+        check("卡住时按超时返回（0.2~1.5s）", 0.15 <= dt < 1.5, "%.3fs" % dt)
+
+        # ---- ④ 超时之后要退避：紧接着再抓不该再等一轮、也不该再发 PrintWindow
+        #     （微信"每 2~4 秒卡一下"时，`IsHungAppWindow` 那道闸不会触发，
+        #      全靠这条退避把 UI 线程的卡顿压到"每 10 秒最多一次"）
+        check("超时后进入了退避", capture._hung_until > _t.monotonic())
+        calls["n"] = 0
+        t0 = _t.perf_counter()
+        img = capture.capture_window(1)
+        dt = _t.perf_counter() - t0
+        check("退避期间返回 None", img is None)
+        check("退避期间不再调 PrintWindow", calls["n"] == 0,
+              "调用了 %d 次" % calls["n"])
+        check("退避期间立刻返回（<0.05s）", dt < 0.05, "%.3fs" % dt)
+    finally:
+        capture._capture_once = real_once
+        capture.window_responding = real_resp
+        capture._hung_until = real_hung
+
+    # ---- ⑤ 真实句柄判定：无效句柄 / 0 都必须判成"不响应"
+    check("window_responding(0) = False",
+          capture.window_responding(0) is False)
+    check("window_responding(无效句柄) = False",
+          capture.window_responding(999999999) is False)
+
+
+# ============================================================ 6. capture_mode 解析
 
 def test_capture_mode():
-    print("\n5. sender.capture_mode 解析（默认必须是 printwindow）")
+    print("\n6. sender.capture_mode 解析（默认必须是 printwindow）")
 
     def mode_of(**kw):
         cfg = FakeCfg(**kw)
@@ -170,6 +250,7 @@ if __name__ == "__main__":
     test_crop()
     test_blank()
     test_capture_robust()
+    test_hung_guard()
     test_capture_mode()
 
     print("\n" + "=" * 74)

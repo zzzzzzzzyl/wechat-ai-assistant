@@ -46,25 +46,36 @@
      大面积都是灰阶，绿只出现在强调点上。所以想"更像微信"，
      方向是**减少绿的用量**，不是增加。
 
-主题怎么决定（三级，见 `detect()`）
------------------------------------
-    ① `ui.theme` 显式指定      用户钉死，最高优先级
-    ② 采样微信窗口的实际渲染    最准：微信设成什么就是什么
-    ③ 系统注册表               微信最小化（抓图空白）时的兜底
+主题怎么决定（见 `detect()`）
+------------------------------
+`ui.theme` 只有**三种**写法：
 
-为什么"跟随系统"不够
---------------------
-微信的**外观是独立设置**的（设置 → 通用 → 外观 → 跟随系统/浅色/深色）。
-如果系统是深色、微信手动设成浅色，只跟随系统就会让助手面板是黑的、微信是白的，
-并排摆着很难看。② 直接看微信渲染出来是什么颜色，绕开这个不一致。
+    "system"（默认，界面上叫「跟随系统」）  读系统注册表（深色 / 浅色）
+    "dark" / "light"                        钉死
+
+**为什么把「跟随微信」撤掉了**（2026-10-19，用户："只保留一个，不需要冗杂"）
+------------------------------------------------------------------------
+以前默认「跟随微信」：抓一张微信窗口的位图（`sample_wechat_theme`）看它实际渲染成
+深色还是浅色。它确实更准 —— 微信的外观是**独立设置**的，系统深色 + 微信浅色时，
+只跟系统会让面板和微信一黑一白并排摆着。
+
+但那个采样是 `PrintWindow`，**同步的跨进程消息**：微信的 UI 线程不泵消息时，
+它一直不返回。2026-10-19 用户报的「放到后台 / 休眠后卡死」就是这条链
+（它跑在 **Qt UI 线程**上）。抓图那边已经加了闸门和看门狗（见 `capture.py`），
+但用户要的是**不要这个冗杂**：主题只跟系统，运行时一次窗口都不读。
+
+⚠️ `sample_wechat_theme()` **留着**，但只给探针用（`probes/probe_theme*.py`、
+`probes/qt/measure_wechat_light.py` 这些要"量微信到底是什么颜色"），
+`detect()` 不再调它 —— 别看到函数还在就以为这条路还活着。
 """
 
 from typing import Dict, Optional
 
-# 主题名
+# 主题名（前两个是**结果**，后两个是 `ui.theme` 里可写的"不钉死"值）
 DARK = "dark"
 LIGHT = "light"
-AUTO = "auto"          # 跟随（采样微信 -> 系统）
+SYSTEM = "system"      # 跟随系统：只读注册表，**不抓窗口**（界面上的默认）
+AUTO = "auto"          # 老写法，等同 SYSTEM（`detect()` 拿它当缺省值）
 
 # ---------------------------------------------------------------- 色板
 #
@@ -391,23 +402,35 @@ def sample_wechat_theme(hwnd: int) -> Optional[str]:
         return None
 
 
-# `ui.theme` 写这些值都表示"不要钉死，去自动判断"
-AUTO_ALIASES = {"", "auto", "system", "follow", "跟随", "跟随系统", "自动"}
+# `ui.theme` 写这些值都表示"不钉死 -> **跟随系统**"。
+# ⚠️ 2026-10-19：这里曾经含 `"auto"` / `"跟随微信"`，那时它们表示**采样微信窗口**；
+#    而采样就是那条会卡住的抓图（见模块顶部）。现在这些写法统统落到"跟随系统"，
+#    老配置**既不报错、也不会再抓图** —— 有意为之：静默降级到更安全的那个。
+FOLLOW_ALIASES = {"", "auto", "system", "sys", "follow",
+                  "跟随", "跟随微信", "跟随系统", "跟系统", "自动"}
 
 
-def is_auto(want) -> bool:
-    """`ui.theme` 的值是否是"自动跟随"。"""
-    return str(want or "").strip().lower() in AUTO_ALIASES
+def is_follow(want) -> bool:
+    """`ui.theme` 是不是**没钉死**（= 跟随系统）。
+
+    ⚠️ 名字里的 follow 来自旧写法 `follow`/`auto`（当时是"跟着微信的颜色走"）。
+       现在的含义就是"跟 Windows 的深浅色"，而且**一次窗口都不读**。
+    ⚠️ 它决定"要不要让 `detect()` 去读注册表"：UI 线程上那条每 5 秒的检查
+       （`panel._resample_theme_foreground`）靠它分流。
+    """
+    return str(want or "").strip().lower() in FOLLOW_ALIASES
 
 
 def detect(cfg=None, hwnd: int = 0, logger=None) -> str:
     """决定用哪套色板。返回 "dark" 或 "light"。
 
-    顺序（前面的赢）：
-        ① config 里 `ui.theme` 明确写了 dark / light
-        ② 采样微信窗口的实际渲染
-        ③ 系统注册表
-    `ui.theme: auto`（默认）表示"走 ②③"。
+    只有两种可能：
+        · `ui.theme` 是 dark / light  -> 直接用它
+        · 其余（"system" / "auto" / 空 / 旧的"跟随微信"） -> 读系统注册表
+
+    ⚠️ `hwnd` 是**历史参数**：以前要拿它去采样微信窗口（`sample_wechat_theme` →
+        `PrintWindow`）。那条链 2026-10-19 撤掉了（见模块顶部），参数只为不改一堆
+        调用点而留着，**现在完全没用到**。
     """
     log = logger or (lambda m: None)
 
@@ -418,18 +441,13 @@ def detect(cfg=None, hwnd: int = 0, logger=None) -> str:
         except Exception:
             want = AUTO
 
-    if not is_auto(want):
+    if not is_follow(want):
         forced = _norm(want)
         log("主题：配置指定 -> %s" % forced)
         return forced
 
-    sampled = sample_wechat_theme(hwnd)
-    if sampled:
-        log("主题：采样微信窗口 -> %s" % sampled)
-        return sampled
-
     sys_theme = system_theme()
-    log("主题：采样不到微信窗口（可能最小化），退到系统设置 -> %s" % sys_theme)
+    log("主题：跟随系统 -> %s" % sys_theme)
     return sys_theme
 
 
