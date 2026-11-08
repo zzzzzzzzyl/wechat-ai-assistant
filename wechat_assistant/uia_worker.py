@@ -58,6 +58,17 @@ class UiaWorker:
             import uiautomation as auto
             from uiautomation import uiautomation as core
 
+            # ⚠️⚠️ 2026-11-08：`_AutomationClient` 是**进程级单例**，它绑在
+            #    "创建它的那条线程"的 COM apartment 上。工作线程重建后如果继续
+            #    复用旧实例，之后每次 `ElementFromHandle` 都会抛
+            #    `COMError 0x80040201（事件无法调用任何订户）` ——
+            #    实测现象：重建线程后错误**依旧**（因为根本没换客户端）。
+            #    所以新线程起来时**必须把它清掉**，让它在本线程里重建一份。
+            try:
+                core._AutomationClient._instance = None
+            except Exception:
+                pass
+
             ctx = auto.UIAutomationInitializerInThread(debug=False)
             ctx.__enter__()
             self._auto = auto
@@ -103,6 +114,16 @@ class UiaWorker:
             self._generation += 1
             self._log("重建 UIA 工作线程（generation=%d）" % self._generation)
             self._start()
+
+    def restart(self) -> None:
+        """公开的重建入口 —— 调用方遇到 COM 层瞬态错误时用它来"换一条线程重来"。
+
+        ⚠️ 为什么需要：`COMError 0x80040201`（"事件无法调用任何订户"）通常出现在
+            **微信刚启动、窗口正在重建/重绘**的那几秒 —— 是 provider 侧的瞬态，
+            重建 COM 线程后一次就能读。以前只对**超时**重建，COM 错误直接抛给
+            用户，界面上一行 `处理失败: UiaError: COMError: (...)` 就没了下文。
+        """
+        self._restart()
 
     # ------------------------------------------------------------ 对外
 

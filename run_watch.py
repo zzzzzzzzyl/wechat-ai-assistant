@@ -947,6 +947,59 @@ def main():
             for i, r in enumerate(replies, 1):
                 log("  %d. %s" % (i, r))
 
+    def resolve_window():
+        """重新定位微信主窗口；句柄变了就更新 `hwnd` / `win`，返回当前句柄（0=没找到）。
+
+        ⚠️⚠️ 2026-11-08 实测：`hwnd` 是**启动那一刻**抓的，微信重新登录或主窗口被
+            重建后它不会自己刷新。拿旧句柄去 `ElementFromHandle` 会抛
+            `COMError 0x80040201`（"事件无法调用任何订户"），而界面显示的
+            「读不到微信内容（可能在重绘）」会让人以为是 transient ——
+            **其实重绘完了也不会好**。记录器每拍自己 `find_window()` 所以没事，
+            只有"点生成"这条路径会中招（用户报的正是这个）。
+        """
+        nonlocal hwnd, win
+        try:
+            w = reader.find_window()
+        except Exception as e:
+            log("重新定位微信窗口失败: %s: %s" % (type(e).__name__, e))
+            return hwnd
+        if w and w.get("hwnd") != hwnd:
+            log("微信窗口句柄变了（%s -> %s），已重新定位"
+                % (hex(hwnd or 0), hex(w["hwnd"])))
+            win, hwnd = w, w["hwnd"]
+        return hwnd
+
+    def read_chat_retry(hwnd_, tries: int = 1):
+        """读一屏；遇到 UIA 的 COM 层瞬态错误就重建线程再试一次。
+
+        ⚠️ 2026-11-08 实测（用户报「遇到没出现过的错误」）：微信刚启动/窗口重绘时，
+            `read_chat` 会抛 `COMError: (-2147220991, '事件无法调用任何订户')`
+            （= `0x80040201`）。这是 provider 侧瞬态，重建 COM 线程后一次就能读；
+            以前只有**超时**才会重建，COM 错误直接把 `UiaError: COMError: (...)`
+            甩到界面状态行上，用户看到的是一串天书，而且日志里一个字都没有。
+        """
+        try:
+            return reader.read_chat(hwnd_)
+        except Exception as e:
+            msg = "%s: %s" % (type(e).__name__, e)
+            if tries > 0 and "COMError" in msg:
+                log("读屏遇到 COM 错误，重建 UIA 线程后重试一次")
+                # ⚠️ `reader` 是 **AutoReader**（选路器），真正的 worker 挂在
+                #    `reader.uia`（WeChatReader）上 —— 直接写 `reader.worker`
+                #    会抛 AttributeError，重试等于没做（2026-11-08 实测日志里就是这句）。
+                _uia = getattr(reader, "uia", None)
+                _wk = getattr(_uia, "worker", None) if _uia is not None else None
+                try:
+                    if _wk is not None:
+                        _wk.restart()
+                    else:
+                        log("读屏器没有 UIA 工作线程（可能是 OCR 后端），跳过重建")
+                except Exception as e2:
+                    log("重建 UIA 线程失败（继续沿用旧的）: %s: %s"
+                        % (type(e2).__name__, e2))
+                return read_chat_retry(hwnd_, tries - 1)
+            raise
+
     def do_generate(reason, want_generate=True, user_intent=""):
         """读取当前会话并（可选）生成建议。跑在独立线程，避免阻塞触发用的消息循环。
 
@@ -954,6 +1007,8 @@ def main():
         非空时 AI 严格按它写，不再自己猜立场 —— 见 ai.py 的
         【最高优先级 ·「我」想表达的意思】。
         """
+        # 下面会在读到窗口句柄变化时**重新绑定**这两个（见「每次生成前重新定位窗口」）
+        nonlocal hwnd, win
         with gen_lock:
             if state["busy"]:
                 emit("上一条还没处理完")
@@ -968,7 +1023,10 @@ def main():
             ui.set_busy(True)
         try:
             emit("正在读取会话…")
-            snap = reader.read_chat(hwnd)
+            if not resolve_window():
+                emit("没找到微信窗口，先在微信里打开一个会话")
+                return
+            snap = read_chat_retry(hwnd)
             if not snap:
                 # ⚠️ 区分「没打开会话」和「读出来了但什么都认不到」——
                 #    两者在界面上长得一模一样，但该做的事完全不同。
@@ -1369,7 +1427,16 @@ def main():
             except Exception as e:
                 show_replies(sess, [], "%s: %s" % (type(e).__name__, e))
         except Exception as e:
-            emit("处理失败: %s: %s" % (type(e).__name__, e))
+            # ⚠️ 2026-11-08：这里以前**只往状态行写**，日志里一个字都没有 ——
+            #    用户报「遇到没出现过的错误」时，我只能用 UIA 去把界面上那行读出来。
+            #    任何失败都必须**同时落日志**，否则等于没记录。
+            msg = "%s: %s" % (type(e).__name__, e)
+            log("处理失败: " + msg)
+            if "COMError" in msg:
+                # UIA 的 COM 瞬态：给用户一句能懂的，原始错误看日志
+                emit("读不到微信内容（可能在重绘），稍等再点一次")
+            else:
+                emit("处理失败: %s" % (msg[:26]))
         finally:
             state["busy"] = False
             if ui is not None:
@@ -1411,7 +1478,8 @@ def main():
         if ui is None:
             return
         try:
-            snap = reader.read_chat(hwnd)
+            resolve_window()          # 句柄可能已经变了（见 `resolve_window()`）
+            snap = read_chat_retry(hwnd)
             if not snap or not snap.title:
                 ui.post_status("当前没有打开的会话，没法清空")
                 return
