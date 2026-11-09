@@ -800,15 +800,16 @@ def test_save(app, tmp):
             store2.set("ai.base_url", "https://api.example.com")
             store2.set("ai.model", "my-model")
             store2.save()
+            # ⚠️ 2026-11-09 曾短暂挪进「基础设置」，已按用户要求**回退**到「AI 接口」。
             win2.open("ai")
             pump(app, 200)
-            # ⚠️ 判据用**数量**：AI 组里被覆盖的只有地址和模型这两项（都是 `RESET_KEEP`），
-            #    所以这一组里**一颗「恢复默认」都不该有**。
-            #    改坏了会变成 2 颗 —— 比"按坐标找那一行"更硬也更简单。
+            # ⚠️ 判据用**数量**：`RESET_KEEP`（地址 / 模型 / Key）那三行**不画**「恢复默认」，
+            #    这一组里其余项在本次测试里都没被覆盖 → **一颗都不该有**。
+            # 改坏了会变成 2 颗（地址、模型各一颗）。
             from wechat_assistant.qt_ui.widgets import Pill
             _pills = [b for b in win2.findChildren(Pill)
                       if getattr(b, "text", None) and b.text() == "恢复默认"]
-            check("「AI 接口」组里没有「恢复默认」按钮（地址/模型那两行不画它）",
+            check("「AI 接口」组里没有「恢复默认」按钮（地址 / 模型 / Key 都不画）",
                   len(_pills) == 0, "找到 %d 颗" % len(_pills))
             ok, err = safe(lambda: win2._reset_one("ai.base_url"))
             pump(app, 80)
@@ -1056,7 +1057,7 @@ def test_test_connection(app, tmp):
         return real(base_url, key, model)
 
     try:
-        win.open("ai")
+        win.open("ai")            # 2026-11-09：三样必填项回退到「AI 接口」组
         pump(app, 200)
         win._fields["ai.base_url"].box.set("")
         win._fields["ai.api_key"].field.set("")
@@ -1339,18 +1340,24 @@ def test_geometry(app, tmp):
         # Tk 版这里用的是 GetWindowRect 量真窗口；Qt 侧直接验 `_clamp()` 的语义
         # （拖动和缩放都从它过），比量一次瞬时几何更稳、而且不挑平台。
         try:
-            from wechat_assistant.follow import work_area
+            from wechat_assistant.qt_ui.settings_ui import SettingsWindow
 
-            left, top, right, bottom = work_area()
+            left, top, right, bottom = SettingsWindow._desktop_union()
             area = (left, top, right, bottom)
-            clamped = []
+            vis = SettingsWindow.MIN_VISIBLE
+            # ⚠️ 2026-11-08 **行为改了**（用户报「设置窗口无法被拖动到界面外」）：
+            #    原来要求"整个窗口留在桌面可用区里"，结果副屏也拖不过去。
+            #    现在的契约是：**允许部分出界**，但横向/纵向至少留 `MIN_VISIBLE`
+            #    在可视范围内，而且标题栏那一带不许跑到桌面上面去。
             for x, y in ((99999, 99999), (-99999, -99999)):
                 cx, cy = win._clamp(x, y, 400, 300)
-                clamped.append(
-                    left <= cx and cx + 400 <= right
-                    and top <= cy and cy + 300 <= bottom)
-            check("拖到屏幕外会被夹回桌面可用区（无边框窗口没有任务栏条目，"
-                  "拖丢了就找不回来）", all(clamped), "可用区=%s" % (area,))
+                # 横向：左边缘最多退到"只剩 vis 像素在右边"，或右边缘只剩 vis 在左边
+                inside_x = (cx + 400 >= left + vis) and (cx <= right - vis)
+                # 纵向：上边界不许越过桌面顶部，下边界不许越过"只剩 vis"
+                inside_y = (cy >= top) and (cy <= bottom - vis)
+                check("拖到屏幕外：允许部分出界，但窗口还在够得着的地方",
+                      inside_x and inside_y,
+                      "夹回 (%d,%d)，桌面并集=%s" % (cx, cy, area))
             x0, y0 = win._clamp(100, 100, 400, 300)
             check("夹取对已经在区内的坐标是恒等映射（不乱挪窗口）",
                   (x0, y0) == (100, 100), "-> (%d,%d)" % (x0, y0))
@@ -2095,7 +2102,7 @@ def test_auto_apply(app, tmp):
         win.open()
         win.win.resize(base.px(_MIN_W), base.px(620))
         pump(app, 250)
-        win._switch("ai")
+        win._switch("ai")         # 2026-11-09：接口地址回退到「AI 接口」组
         pump(app, 250)
 
         # ① 打字的项（text / multiline / secret）
@@ -2256,11 +2263,23 @@ def test_levels(app, tmp):
         check("新手：「配置级别」这一项本身可见",
               "ui.level" in win._fields, str(sorted(win._fields)))
         texts = [w.text() for w in labels_of(win.win)]
-        check("新手：画出了「先做这两步」的指引",
-              any("先做这两步" in t for t in texts),
+        check("新手：画出了「先做这一步」的指引",
+              any("先做这一步" in t for t in texts),
               str([t for t in texts if "步" in t][:3]))
-        check("新手：AI 组只留 4 项（Key / 地址 / 模型 / 条数）",
-              len(win._visible_specs("ai")) == 4,
+        # ⚠️ 2026-11-08 用户要求「在新手选项上写一点点 api 填入指引」：
+        #    只写"去填三样"等于没说 —— 要说清 Key 从哪拿、地址/模型在哪。
+        check("新手：指引里写了 API 从哪拿（API 密钥页 + sk- 开头）",
+              any("API 密钥" in t and "sk-" in t for t in texts),
+              str([t for t in texts if "密钥" in t][:2]))
+        check("新手：指引里给了地址/模型的例子（否则新手不知道填什么）",
+              any("deepseek" in t.lower() and "api." in t.lower() for t in texts),
+              str([t for t in texts if "deepseek" in t.lower()][:2]))
+        check("新手：基础设置里只有「配置级别」一项（三样必填在 AI 接口组）",
+              [s.key for s in win._visible_specs("base")] == ["ui.level"],
+              str([s.key for s in win._visible_specs("base")]))
+        check("新手：三样必填在「AI 接口」组里（Key / 地址 / 模型 / 条数）",
+              [s.key for s in win._visible_specs("ai")]
+              == ["ai.api_key", "ai.base_url", "ai.model", "ai.n_replies"],
               str([s.key for s in win._visible_specs("ai")]))
         check("新手：高级组一项都没有",
               len(win._visible_specs("advanced")) == 0,
@@ -2277,8 +2296,8 @@ def test_levels(app, tmp):
               str(store.get("ui.level", "")) == "pro", str(store.get("ui.level")))
         check("高级：「配置级别」仍然在（能切回来）",
               "ui.level" in win._fields, str(sorted(win._fields)))
-        check("高级：ai 组的项数比新手多",
-              len(win._visible_specs("ai")) > 4,
+        check("高级：ai 组的项数比新手多（图片识别 / 视觉模型 / 系统提示词）",
+              len(win._visible_specs("ai")) > 1,
               str(len(win._visible_specs("ai"))))
 
         # ---- 切回新手：分组要收回去（验证不是单向的）
@@ -2290,6 +2309,51 @@ def test_levels(app, tmp):
               str([g[0] for g in win._visible_groups()]))
         check("切回新手后，配置也跟着回去",
               str(store.get("ui.level", "")) == "novice", str(store.get("ui.level")))
+    finally:
+        safe(win.close)
+
+
+def test_drag_offscreen(app, tmp):
+    """窗口可以拖到屏幕外 / 副屏，但标题栏必须留得住（2026-11-08 用户报）。
+
+    ⚠️ 原来的 `_clamp` 把窗口**整个**夹在主屏工作区里：既拖不出边缘，
+       也拖不到副屏（多屏玩家的正常操作）。现在放宽成"只要还够得着就不拦"，
+       但横竖至少留 `MIN_VISIBLE` 像素在可视范围内。
+    """
+    print("\n拖动：可以拖到屏幕外，但不会拖丢")
+    from wechat_assistant.qt_ui.settings_ui import SettingsWindow
+
+    win, _store, _style = make_win(tmp, level="pro")
+    try:
+        win.open()
+        pump(app, 150)
+        w = win.win.width()
+        h = win.win.height()
+        left, top, right, bottom = SettingsWindow._desktop_union()
+        vis = SettingsWindow.MIN_VISIBLE
+
+        x, y = SettingsWindow._clamp(right + 500, top + 100, w, h)
+        check("往右能拖出屏幕（不再整个夹回来）", x > right - w,
+              "x=%d, 屏幕右=%d, 窗口宽=%d" % (x, right, w))
+        check("往右拖到底时仍留一条在屏幕里", x == right - vis,
+              "x=%d，期望 %d" % (x, right - vis))
+
+        x, y = SettingsWindow._clamp(left - 2000, top + 100, w, h)
+        check("往左能拖出屏幕，但同样留一条", x == left - w + vis,
+              "x=%d，期望 %d" % (x, left - w + vis))
+
+        x, y = SettingsWindow._clamp(left + 100, top - 800, w, h)
+        check("往上拖**不许**把标题栏拖出桌面（否则点不回来）", y == top,
+              "y=%d，期望 %d" % (y, top))
+
+        x, y = SettingsWindow._clamp(left + 100, bottom + 800, w, h)
+        check("往下拖允许挂出去，但留一条", y == bottom - vis,
+              "y=%d，期望 %d" % (y, bottom - vis))
+
+        # 正常位置一个数都不该动
+        x, y = SettingsWindow._clamp(left + 40, top + 40, w, h)
+        check("屏幕内的正常位置原样保留", (x, y) == (left + 40, top + 40),
+              "%r" % ((x, y),))
     finally:
         safe(win.close)
 
@@ -2339,6 +2403,7 @@ def main():
         test_textarea_resizable(app, tmp)
         test_auto_apply(app, tmp)
         test_levels(app, tmp)
+        test_drag_offscreen(app, tmp)
         test_no_tk_leftovers()
 
         print("\n15. 没有污染仓库")

@@ -1210,26 +1210,51 @@ class SettingsWindow(QtCore.QObject):
         except Exception as e:
             self._log("设置窗口居中失败: %s: %s" % (type(e).__name__, e))
 
+    #: 拖动时**至少要留这么多像素**落在桌面可视范围内。
+    #:
+    #: ⚠️ 2026-11-08 用户报「设置窗口无法被拖动到界面外」：原来 `_clamp` 把窗口
+    #:    **整个**夹在主屏工作区里 —— 于是既拖不出屏幕边缘，也拖不到副屏
+    #:    （多屏玩家的正常操作）。现在放宽成"只要还够得着就不拦"，
+    #:    但留一条底线：横竖都得有这么多像素在可视范围内，否则窗口会被拖丢。
+    MIN_VISIBLE = 96
+
+    @staticmethod
+    def _desktop_union():
+        """**所有屏幕**可用区域的并集（拖到副屏是正常需求，不能只看主屏）。"""
+        try:
+            from PySide6 import QtCore, QtGui
+
+            app = QtGui.QGuiApplication.instance()
+            screens = app.screens() if app is not None else []
+            uni = None
+            for s in screens:
+                g = s.availableGeometry()
+                uni = QtCore.QRect(g) if uni is None else uni.united(g)
+            if uni is not None and uni.width() > 0 and uni.height() > 0:
+                return uni.left(), uni.top(), uni.right() + 1, uni.bottom() + 1
+        except Exception:
+            pass
+        # 兜底：主屏工作区（`work_area()` 已经把任务栏算出去了）
+        from ..follow import work_area
+        return work_area()
+
     @staticmethod
     def _clamp(x, y, w, h):
-        """把窗口夹在**桌面可用区域**里。
+        """把窗口夹到**还够得着**的位置。
 
-        用 `follow.work_area()` 而不是 `GetSystemMetrics`：后者把任务栏算进去，
-        窗口贴底时会被任务栏挡住。
+        · 允许**部分出界**（拖到屏幕边外、拖到副屏都行）—— 用户明确要的；
+        · 但标题栏那一带必须留在可视范围内：否则窗口一拖丢就再也点不到；
+        · 用**所有屏幕的并集**，不是主屏工作区 —— 后者会把副屏拖拽挡死。
         """
         try:
-            from ..follow import work_area
-            left, top, right, bottom = work_area()
+            left, top, right, bottom = SettingsWindow._desktop_union()
         except Exception:
             return max(0, x), max(0, y)
-        if right - left >= w:
-            x = max(left, min(x, right - w))
-        else:
-            x = left
-        if bottom - top >= h:
-            y = max(top, min(y, bottom - h))
-        else:
-            y = top
+        vis = SettingsWindow.MIN_VISIBLE
+        # 横向：从"只露一小条在右边"到"只露一小条在左边"都允许
+        x = max(left - w + vis, min(x, right - vis))
+        # 纵向：**上边界不许越出桌面**（标题栏得能抓），下边界可以挂出去
+        y = max(top, min(y, bottom - vis))
         return x, y
 
     # ------------------------------------------------------------ 构建
@@ -1565,23 +1590,21 @@ class SettingsWindow(QtCore.QObject):
         lay.setSpacing(st.S("xs"))
 
         if self._level <= 1:
-            title = "新手：先做这两步就能用"
+            title = "新手：先做这一步就能用"
             lines = [
                 "① 到「AI 接口」里填 API Key、接口地址、模型 —— 三样都填了才会生成。",
-                "② 回「外观」里选「跟随微信」—— 面板会自动站到微信旁边。",
-                "其余选项已经收起来了。想调的时候把上面的「配置级别」切到中级或高级，"
-                "改过的值一个都不会丢。",
+                "没用过API Key？去问问AI。怎么申请 API 密钥"
+                "接口地址和模型名在服务商的「接入文档」里。例如 DeepSeek：地址填 https://api.deepseek.com，模型填 deepseek-flash。",
             ]
         elif self._level == 2:
             title = "中级：常用功能都在这里"
             lines = [
                 "超时、刷新间隔、输出上限、文件位置这些调参项还藏在「高级」里。",
-                "切上去就能看到，切回来也不会丢设置。",
             ]
         else:
             title = "高级：全部选项都已显示"
             lines = [
-                "这些项多半设一次就不用动；改坏了在那一项右边点「恢复默认」即可。",
+                "这些设置基本不用动；改坏了在那一项右边点「恢复默认」即可。",
             ]
         lay.addWidget(label(st, title, font_name="body_bold", color_key="text"))
         for ln in lines:
