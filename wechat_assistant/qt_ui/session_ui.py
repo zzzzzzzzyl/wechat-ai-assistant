@@ -641,7 +641,8 @@ class SessionPanel(QtWidgets.QWidget):
         lay.addWidget(rel, 0)
         lay.addSpacing(st.px(3))
         default_rel = self.store.get("persona.default_relationship", "") or ""
-        self._tip(lay, "留空 = 用全局默认「%s」。影响称呼、语气和分寸。" % default_rel)
+        self._tip(lay, "留空 = 用全局默认「%s」。可写名词或一句话，主语用「我」「对方」。"
+                       % default_rel)
         lay.addSpacing(st.px(10))
 
         # ---- 用知识库（2026-10-17）

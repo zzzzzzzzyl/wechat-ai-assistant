@@ -2268,8 +2268,10 @@ def test_levels(app, tmp):
               str([t for t in texts if "步" in t][:3]))
         # ⚠️ 2026-11-08 用户要求「在新手选项上写一点点 api 填入指引」：
         #    只写"去填三样"等于没说 —— 要说清 Key 从哪拿、地址/模型在哪。
-        check("新手：指引里写了 API 从哪拿（API 密钥页 + sk- 开头）",
-              any("API 密钥" in t and "sk-" in t for t in texts),
+        # ⚠️ 2026-11-09 用户把那句改成了「没用过 API Key？去问问 AI 怎么申请
+        #    API 密钥。」—— 措辞归用户，这里只钉"提到了 API 密钥怎么来"这件事。
+        check("新手：指引里写了 API Key 从哪来（提到了申请 API 密钥）",
+              any("API 密钥" in t for t in texts),
               str([t for t in texts if "密钥" in t][:2]))
         check("新手：指引里给了地址/模型的例子（否则新手不知道填什么）",
               any("deepseek" in t.lower() and "api." in t.lower() for t in texts),

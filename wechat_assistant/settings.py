@@ -337,7 +337,7 @@ SPEC: List[Setting] = [
             help="写「你是谁、跟谁说话」。反 AI 腔的规则在「AI 接口 → 系统提示词」；"
                  "想给某个会话单独写，去「会话」分组。"),
     Setting("persona.default_relationship", "persona", "默认关系", "text", default="朋友",
-            help="影响称呼和语气。可以按会话单独覆盖（在「会话」分组里）。"),
+            help="影响称呼和语气。写名词或一句话都行（女朋友 / 我是他的爹）。"),
     Setting("style.enabled", "persona", "口吻样本", "bool", default=True,
             help="把「我」最近发过的短消息喂给模型照着模仿。"),
     Setting("style.max_samples", "advanced", "样本条数", "int", default=12, lo=0, hi=50,

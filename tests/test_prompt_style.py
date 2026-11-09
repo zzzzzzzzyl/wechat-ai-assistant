@@ -93,10 +93,13 @@ def main():
                                     style_samples=samples, relationship=relationship)
     for key in ("【你们的关系】",
                 "【这是「我」平时说话的样子，照着模仿】",
-                "【硬性要求：不要写成 AI 腔】",
-                "【第一步 · 先判断对方那句话的真实意思】",
-                "【第二步 · 按这个判断写 3 条候选】",
-                "【输出格式】"):
+                # ⚠️ 2026-11-09：模板早就改过名了，这里按**当前**的块名断 ——
+                #    原来写的是「【硬性要求：不要写成 AI 腔】」「【第一步 · …】」
+                #    「【输出格式】」，那几块现在叫「【硬性禁止，必须遵守】」
+                #    「【上下文规则】」「【输出要求】」。测试没跟上，一直红着。
+                "【硬性禁止，必须遵守】",
+                "【上下文规则】",
+                "【输出要求】"):
         check("prompt 含 %s" % key, key in system)
     check("要求先判断气话", "气话" in system and "intent" in system)
     check("口吻样本进入了 prompt", all(s in system for s in samples))
@@ -142,9 +145,24 @@ def main():
                                  user_intent=my_intent)
     check("prompt 含「最高优先级」段", "最高优先级" in sys_on and "想表达的意思" in sys_on)
     check("意图原文进了 prompt", my_intent in sys_on)
-    check("第二步改成「同一立场的三种说法」", "同一个立场的三种说法" in sys_on)
-    check("不再要求顺着对方的情绪写", "顺着对方的情绪走" not in sys_on)
-    check("没给意图时仍然是原来的写法", "顺着对方的情绪走" in system)
+    # ⚠️ 2026-11-09：默认模板里**已经没有 `{step2}`** 了（`prompts.py` 里写明了
+    #    "别再往默认模板里加回 {step2}"），所以这两块只在"用户模板带 {step2}"时才渲染。
+    #    于是这里改成直接验**常量**——保住"这两段文字还在"这条底线，而不是验渲染结果。
+    from wechat_assistant import prompts as _prompts
+    check("STEP2 两块都还在（用户模板带 {step2} 时会用）",
+          "同一个立场的" in _prompts.STEP2_INTENT
+          and "顺着对方的情绪走" in _prompts.STEP2_NORMAL)
+    check("填了意图时不再要求顺着对方情绪", "顺着对方的情绪走" not in sys_on)
+    check("没给意图时默认模板也不出现「顺着对方的情绪走」（它只在 STEP2_NORMAL 里）",
+          "顺着对方的情绪走" not in system)
+
+    print("\n5b. 关系那块：不拼成一句话（2026-11-09 用户报「关系拼接导致混乱」）")
+    _rel = _prompts.RELATIONSHIP_BLOCK % "他是我的狗"
+    check("关系原话后面**不接句号**（不再拼成「…。称呼、语气…」一句话）",
+          "【你们的关系】他是我的狗\n" in _rel, repr(_rel[:60]))
+    check("括注里说清了「我」指谁、对方指谁（防主语弄反）",
+          "「我」指使用者本人" in _rel and "对方就是正在聊天的人" in _rel,
+          repr(_rel[:120]))
 
     print("\n6. 真实生成对比：给不给意图，差别有多大")
     # 用一个**容易猜错立场**的场景：对方在念叨，但「我」其实想回去。

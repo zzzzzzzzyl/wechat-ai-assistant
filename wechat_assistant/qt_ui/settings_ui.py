@@ -1592,14 +1592,15 @@ class SettingsWindow(QtCore.QObject):
         if self._level <= 1:
             title = "新手：先做这一步就能用"
             lines = [
-                "① 到「AI 接口」里填 API Key、接口地址、模型 —— 三样都填了才会生成。",
-                "没用过API Key？去问问AI。怎么申请 API 密钥"
+                "到「AI 接口」里填 API Key、接口地址、模型 —— 三样都填了才会生成。",
+                "",
+                "没用过API Key？去问问 AI 怎么申请 API 密钥。",
                 "接口地址和模型名在服务商的「接入文档」里。例如 DeepSeek：地址填 https://api.deepseek.com，模型填 deepseek-flash。",
             ]
         elif self._level == 2:
             title = "中级：常用功能都在这里"
             lines = [
-                "超时、刷新间隔、输出上限、文件位置这些调参项还藏在「高级」里。",
+                "可设置全局提示词、人设口吻，可导入知识库",
             ]
         else:
             title = "高级：全部选项都已显示"
