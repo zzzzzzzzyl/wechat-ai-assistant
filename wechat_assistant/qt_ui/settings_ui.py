@@ -1572,6 +1572,70 @@ class SettingsWindow(QtCore.QObject):
             self.scroll.add(hline(st))
             self.scroll.add(self._build_kb_files())
 
+        # 「外观」组：「开机自启」**不在 SPEC 里** —— 它是**系统状态**（注册表），
+        # 不该落 `settings.json`（真落了就会出现"界面说开着、注册表里却被清理软件删了"
+        # 的假开关）。所以由代码画一行，每次进页面读**注册表真实值**（见 `autostart.py`）。
+        if self._group == "ui":
+            self.scroll.add(hline(st))
+            self.scroll.add(self._build_autostart())
+
+    # ------------------------------------------------------------ 开机自启
+
+    def _build_autostart(self):
+        """「外观」组末尾：**开机自启**开关。
+
+        ⚠️ 2026-11-09 用户要求「设置中可以设置开机自动启动」。
+        ⚠️ 这一块**不是 SPEC 的一行**（和 `kb-files` / `level-guide` 一样，
+           测试里按 `objectName` 跳过）：它读写的不是配置，而是注册表启动项。
+        ⚠️ 值**每次进页面都重新读**（`autostart.state()`），不回写 store ——
+           否则界面会替系统"记着"一个已经不存在的状态。
+        """
+        from .. import autostart
+
+        st = self.style
+        box = QtWidgets.QWidget(self.scroll.inner)
+        box.setObjectName("autostart")
+        lay = QtWidgets.QVBoxLayout(box)
+        lay.setContentsMargins(st.S("xl"), st.S("md"), st.S("xl"), st.S("lg"))
+        lay.setSpacing(st.S("xs"))
+
+        on, _cmd = autostart.state()
+        row = QtWidgets.QHBoxLayout()
+        row.setSpacing(st.S("md"))
+        row.addWidget(label(st, "开机自启", font_name="body", color_key="text"))
+        row.addStretch(1)
+        row.addWidget(Switch(st, on, parent=box, command=self._on_autostart))
+        lay.addLayout(row)
+
+        # ⚠️ 文案里**不写注册表路径、不写 exe 文件名**（设置界面是给用户看的）。
+        tip = "登录 Windows 后自动启动。微信开着就能用，不用每次手动点。"
+        if on and autostart.is_stale():
+            tip = "启动项还指着旧位置，拨一下开关重新记一遍。"
+        lay.addWidget(label(st, tip, font_name="small",
+                            color_key="text_dim", wrap=True))
+        return box
+
+    def _on_autostart(self, value):
+        """拨开关：写/删注册表启动项。失败就**重建这一页**（开关回到真实状态）。"""
+        from .. import autostart
+
+        try:
+            if value:
+                autostart.enable()
+                self._say("已设为开机自启")
+            else:
+                if not autostart.disable():
+                    raise OSError("删除启动项失败")
+                self._say("已取消开机自启")
+        except Exception as e:
+            self._log("改开机启动项失败: %s: %s" % (type(e).__name__, e))
+            self._say("改不了启动项，权限可能不够")
+            # 回滚显示：重建（重读注册表），别让开关停在"以为改好了"
+            try:
+                self._build()
+            except Exception:
+                pass
+
     # ------------------------------------------------------------ 级别指引
 
     def _build_level_guide(self):

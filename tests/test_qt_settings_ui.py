@@ -1223,7 +1223,9 @@ def test_both_themes(app, tmp):
                 #    不跳过去的话这里会 `KeyError: '?'`（实测）。
                 # ⚠️ 2026-11-08：「基础设置」下面同样挂了一块新手引导
                 #    （`_build_level_guide`，objectName="level-guide"），同一个理由跳过。
-                if w.objectName() in ("kb-files", "level-guide"):
+                # ⚠️ 2026-11-09：「外观」组末尾挂了「开机自启」一行
+                #    （`_build_autostart`，objectName="autostart"）—— 同样不是 SPEC 的项。
+                if w.objectName() in ("kb-files", "level-guide", "autostart"):
                     continue
                 k = keys[ri] if ri < len(keys) else "?"
                 ri += 1
@@ -2360,6 +2362,81 @@ def test_drag_offscreen(app, tmp):
         safe(win.close)
 
 
+def test_autostart_switch(app, tmp):
+    """「外观」组里的**开机自启**开关（2026-11-09 用户要求）。
+
+    ⚠️⚠️ **绝不碰真实的 `HKCU\\...\\Run`**：那是用户真正的开机启动项。
+       这里把 `autostart.RUN_KEY` 换成临时子键，跑完删掉。
+    ⚠️ 这个开关**不落 `settings.json`** —— 它是系统状态，界面每次重建都重读注册表。
+    """
+    print("\n14e. 开机自启开关（写临时注册表键）")
+    from PySide6 import QtWidgets
+
+    from wechat_assistant import autostart
+    from wechat_assistant.qt_ui.settings_ui import SettingsWindow
+
+    def _cleanup():
+        import winreg
+
+        for k in (autostart.RUN_KEY, r"Software\wechat-ai-assistant-test\Run"):
+            try:
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, k, 0,
+                                    winreg.KEY_SET_VALUE) as h:
+                    try:
+                        winreg.DeleteValue(h, autostart.VALUE_NAME)
+                    except FileNotFoundError:
+                        pass
+            except OSError:
+                pass
+
+    old_key = autostart.RUN_KEY
+    autostart.RUN_KEY = r"Software\wechat-ai-assistant-test\Run"
+    win, store, _style = make_win(tmp, level="pro")
+    try:
+        _cleanup()
+        win.open("ui")
+        pump(app, 250)
+        boxes = [w for w in win.win.findChildren(QtWidgets.QWidget)
+                 if w.objectName() == "autostart"]
+        check("「外观」页里有「开机自启」这一块", len(boxes) == 1, str(len(boxes)))
+        texts = [w.text() for w in labels_of(win.win)]
+        check("标题就叫「开机自启」", "开机自启" in texts,
+              str([t for t in texts if "自启" in t][:2]))
+
+        # 关 -> 开：真的写进注册表
+        win._on_autostart(True)
+        pump(app, 150)
+        on, cmd = autostart.state()
+        check("拨到开之后注册表里有这个值", on, repr(cmd))
+        check("写进去的命令指的就是这份程序",
+              cmd.strip() == autostart.command().strip(), repr(cmd))
+        check("开关本身也是开的（状态没跑偏）", autostart.is_enabled() is True)
+
+        # 开 -> 关：值被删掉
+        win._on_autostart(False)
+        pump(app, 150)
+        check("拨到关之后注册表里没有这个值", autostart.is_enabled() is False,
+              str(autostart.state()))
+
+        # 2026-11-09：**不能**把状态写进 settings.json（否则会出现假开关）
+        check("没有把状态写进配置（它是系统状态，不是配置）",
+              "ui.autostart" not in store.overrides(),
+              str(sorted(store.overrides().keys())))
+    finally:
+        _cleanup()
+        autostart.RUN_KEY = old_key
+        try:
+            import winreg
+
+            winreg.DeleteKey(winreg.HKEY_CURRENT_USER,
+                             r"Software\wechat-ai-assistant-test\Run")
+            winreg.DeleteKey(winreg.HKEY_CURRENT_USER,
+                             r"Software\wechat-ai-assistant-test")
+        except OSError:
+            pass
+        safe(win.close)
+
+
 def main():
     print("=" * 70)
     print("Qt 设置窗口测试")
@@ -2406,6 +2483,7 @@ def main():
         test_auto_apply(app, tmp)
         test_levels(app, tmp)
         test_drag_offscreen(app, tmp)
+        test_autostart_switch(app, tmp)
         test_no_tk_leftovers()
 
         print("\n15. 没有污染仓库")
