@@ -301,6 +301,70 @@ def encode_for_model(img, max_side: int = IMG_MAX_SIDE,
     return base64.b64encode(data).decode("ascii")
 
 
+#: 两张图**判定为同一张**的汉明距离上限（64 位 dHash）。
+#:
+#: ⚠️ 6 是实测选出来的：同一张图裁两次（±1px 偏移、重新缩放）通常差 0~3 位；
+#:    不同但相似的图（两张不同的表情包）一般差 12 位以上。
+#:    调大就会把"像但不相同"的两张图并成一张，那是**丢信息**，比多花 token 糟。
+DUPE_TOLERANCE = 6
+
+
+def dhash(img, size: int = 8) -> int:
+    """64 位差值哈希（dHash）——**不引入 imagehash 依赖**，PIL 就够。
+
+    做法：缩成 (size+1)×size 的灰度图，逐行比较"左像素 > 右像素"，
+    得到一个 64 位整数。对尺寸变化、JPEG 噪声、±1px 偏移都不敏感。
+    """
+    from PIL import Image
+
+    small = img.convert("L").resize((size + 1, size), Image.LANCZOS)
+    px = list(small.getdata())
+    bits = 0
+    k = 0
+    for y in range(size):
+        row = px[y * (size + 1):(y + 1) * (size + 1)]
+        for x in range(size):
+            if row[x] > row[x + 1]:
+                bits |= (1 << k)
+            k += 1
+    return bits
+
+
+def is_same_picture(h1: int, h2: int, tol: int = DUPE_TOLERANCE) -> bool:
+    """两个 dHash 是不是同一张图（汉明距离 ≤ tol）。"""
+    try:
+        return bin(int(h1) ^ int(h2)).count("1") <= tol
+    except Exception:
+        return False
+
+
+def dedupe_crops(images, tol: int = DUPE_TOLERANCE):
+    """把一批 PIL 图**按感知哈希去重**，返回 (保留的图, 去掉几张)。
+
+    ⚠️ 2026-11-09 用户要求「处理图片去重」：聊天里同一张图被发两遍
+        （重复转发的表情包、同一张截图连发）会让同一次请求里带两张一模一样的图，
+        **视觉模型按图算 token，等于白花一份钱**。
+    ⚠️ 只去掉**完全重复**的（dHash 距离 ≤ 6），宁可少去也别误删：
+        两张不同的图被并成一张是丢信息，比多花点 token 严重得多。
+    ⚠️ 保留**首次出现**的那张（顺序与调用方给的一致）。
+    """
+    kept = []
+    hashes = []
+    dropped = 0
+    for img in images or []:
+        try:
+            h = dhash(img)
+        except Exception:
+            kept.append(img)          # 算不出哈希就别去重，宁可多发一张
+            continue
+        if any(is_same_picture(h, other, tol) for other in hashes):
+            dropped += 1
+            continue
+        hashes.append(h)
+        kept.append(img)
+    return kept, dropped
+
+
 def kb_of(b64_list) -> int:
     """一串 base64 大约多少 KB（给日志用，不解码整串）。"""
     try:

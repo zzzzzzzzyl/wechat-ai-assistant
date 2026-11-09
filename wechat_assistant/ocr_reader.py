@@ -1498,6 +1498,10 @@ class OcrReader:
         #: ⚠️ **必须在 `__init__` 里初始化**（项目铁律：实例属性先赋值再读，
         #:    有 AST 守门测试 `test_ocr_reader` §17 查这条）。
         self._img_logged = None
+        #: 被张数上限丢掉几张 / 被去重去掉几张（由 `_crop_images` 每拍写）。
+        #: ⚠️ 同样要在 `__init__` 初始化（AST 守门测试查"先赋值再读"）。
+        self._img_skipped = 0
+        self._img_dup = 0
 
     def use_config(self, cfg) -> None:
         """设置界面保存后换一份新配置（**不重启就生效**）。
@@ -1828,7 +1832,7 @@ class OcrReader:
         self._img_skipped = max(0, len(cands) - limit) if limit > 0 else 0
         if limit > 0:
             cands = cands[-limit:]        # 只发**最近**的几张（后面的更新）
-        out = []
+        crops = []
         for m in cands:
             try:
                 x1, y1, x2, y2 = (int(v) for v in m.rect)
@@ -1838,9 +1842,12 @@ class OcrReader:
             x2, y2 = min(area.width, x2), min(area.height, y2)
             if x2 - x1 < 8 or y2 - y1 < 8:
                 continue
-            sub = area.crop((x1, y1, x2, y2))
-            out.append(capture.encode_for_model(sub))
-        return out
+            crops.append(area.crop((x1, y1, x2, y2)))
+        # ⚠️ 2026-11-09：同一张图被发两遍（重复转发的表情包 / 连发截图）时，
+        #    同一次请求里带两张一样的图 = 白花一份 token。感知哈希去重，见
+        #    `capture.dedupe_crops`。
+        crops, self._img_dup = capture.dedupe_crops(crops)
+        return [capture.encode_for_model(sub) for sub in crops]
 
     def _finish(self, snap, area, image_rects) -> None:
         """收尾三件事（**原地改 `snap`**）：补图片消息、判群聊、标发言人。
@@ -1902,16 +1909,19 @@ class OcrReader:
             #    视觉模型按图算 token，只报张数看不出贵在哪。
             _kb = capture.kb_of(snap.images)
             _skip = getattr(self, "_img_skipped", 0)
+            _dup = getattr(self, "_img_dup", 0)
             n_img = len(snap.images)
-            if (n_img, _kb, _skip) != self._img_logged:
-                self._img_logged = (n_img, _kb, _skip)
+            if (n_img, _kb, _skip, _dup) != self._img_logged:
+                self._img_logged = (n_img, _kb, _skip, _dup)
                 if n_img:
+                    _extra = ("，另有 %d 张没发（上限 %d）"
+                              % (_skip, int(self.cfg.get("ocr_read.max_images",
+                                                         capture.IMG_MAX_COUNT) or 0))
+                              if _skip else "")
+                    if _dup:
+                        _extra += "，去重 %d 张" % _dup
                     self._log("附带 %d 张图片给模型看（约 %d KB）%s"
-                              % (n_img, _kb,
-                                 ("，另有 %d 张没发（上限 %d）"
-                                  % (_skip, int(self.cfg.get("ocr_read.max_images",
-                                                             capture.IMG_MAX_COUNT) or 0)))
-                                 if _skip else ""))
+                              % (n_img, _kb, _extra))
                 else:
                     self._log("本屏没有可发的图片（开关是开的）")
 

@@ -425,16 +425,21 @@ def _crop_images_from_window(hwnd: int, rects, limit: int = None,
     skipped = max(0, len(rects) - limit) if limit > 0 else 0
     if limit > 0:
         rects = rects[-limit:]
-    out = []
+    crops = []
     for r in rects:
         sub = capture.crop_window_region(img, wrect, r)
         if sub is None or sub.width < 8 or sub.height < 8:
             continue
-        out.append(capture.encode_for_model(sub))
+        crops.append(sub)
+    # ⚠️ 2026-11-09：同一张图被连发两遍时，一次请求里带两张一样的 = 白花 token。
+    crops, dup = capture.dedupe_crops(crops)
+    out = [capture.encode_for_model(sub) for sub in crops]
     if out:
+        _extra = ("，另有 %d 张没发（上限 %d）" % (skipped, limit)) if skipped else ""
+        if dup:
+            _extra += "，去重 %d 张" % dup
         log("附带 %d 张图片给模型看（约 %d KB）%s"
-            % (len(out), capture.kb_of(out),
-               ("，另有 %d 张没发（上限 %d）" % (skipped, limit)) if skipped else ""))
+            % (len(out), capture.kb_of(out), _extra))
     return out
 
 

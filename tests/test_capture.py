@@ -241,6 +241,50 @@ def test_capture_mode():
           mode_of(**{"sender.capture_mode": ""}) == "printwindow")
 
 
+def test_image_dedupe():
+    """图片去重：同一张图的"两次裁剪"要判同，不同的图不能误并（2026-11-09）。
+
+    背景：聊天里同一张图被连发两遍（重复转发的表情包 / 连发截图）时，
+    同一次请求会带两张一样的图 —— 视觉模型按图算 token，等于白花一份钱。
+    去重靠 **dHash**（64 位，PIL 自带，不引入 imagehash 依赖）。
+    """
+    print("\n7. 图片去重（dHash）")
+    from wechat_assistant import capture
+
+    base = Image.effect_noise((300, 200), 40).convert("RGB")
+
+    # 模拟"同一张图，两次裁剪位置差 1px + 重新缩放"
+    same_ish = base.crop((0, 0, 299, 199)).resize((300, 200))
+    other = Image.effect_noise((300, 200), 40).convert("RGB")
+
+    h1, h2, h3 = capture.dhash(base), capture.dhash(same_ish), capture.dhash(other)
+    check("同一张图（偏移+缩放）判为相同", capture.is_same_picture(h1, h2),
+          "汉明距离 %d" % bin(h1 ^ h2).count("1"))
+    check("不同的图**不**判为相同", not capture.is_same_picture(h1, h3),
+          "汉明距离 %d" % bin(h1 ^ h3).count("1"))
+
+    kept, dropped = capture.dedupe_crops([base, same_ish, other])
+    check("去重：3 张留 2 张", len(kept) == 2 and dropped == 1,
+          "%d / %d" % (len(kept), dropped))
+    check("去重保留**首次出现**的那张（顺序不变）",
+          kept[0] is base and kept[1] is other)
+
+    kept2, dropped2 = capture.dedupe_crops([base, base, base])
+    check("同一张出现三次 -> 只留一张", len(kept2) == 1 and dropped2 == 2,
+          "%d / %d" % (len(kept2), dropped2))
+
+    # JPEG 重编码（模型实际收到的就是 JPEG）之后仍应判同
+    import io
+
+    buf = io.BytesIO()
+    base.save(buf, format="JPEG", quality=85)
+    buf.seek(0)
+    jpeg = Image.open(buf).convert("RGB")
+    check("JPEG 重编码后仍判为同一张",
+          capture.is_same_picture(h1, capture.dhash(jpeg)),
+          "汉明距离 %d" % bin(h1 ^ capture.dhash(jpeg)).count("1"))
+
+
 if __name__ == "__main__":
     print("=" * 74)
     print("取图模块 & 发送者判定取图方式 测试")
@@ -252,6 +296,7 @@ if __name__ == "__main__":
     test_capture_robust()
     test_hung_guard()
     test_capture_mode()
+    test_image_dedupe()
 
     print("\n" + "=" * 74)
     print("结果: %d 通过 / %d 失败" % (PASS, FAIL))
