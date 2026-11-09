@@ -112,13 +112,19 @@ class Setting:
     """
 
     __slots__ = ("key", "group", "label", "kind", "default", "choices",
-                 "lo", "hi", "unit", "help", "restart", "secret", "rows")
+                 "lo", "hi", "unit", "help", "restart", "secret", "rows",
+                 "level")
 
     def __init__(self, key, group, label, kind="text", default=None, choices=None,
                  lo=None, hi=None, unit="", help="", restart=False, secret=False,
-                 rows=None):
+                 rows=None, level=None):
         self.key = key
         self.group = group
+        #: 这一项**第一次出现在哪个级别**（1=新手 / 2=中级 / 3=高级；0=永远显示）。
+        #: ⚠️ 只是**界面过滤**，不影响值是否生效 —— 新手模式下高级项照旧按配置生效。
+        #: 不传就按分组推：`advanced` 组一律 3，其余 2。
+        self.level = (int(level) if level is not None
+                      else (3 if group == "advanced" else 2))
         self.label = label
         self.kind = kind
         self.default = default
@@ -177,6 +183,10 @@ class Setting:
 
 
 GROUPS = [
+    # ⚠️ 2026-11-08：**「基础设置」放最前面**（用户要求「多一个基础设置」）——
+    #    里面只有「配置级别」一项，决定后面各组分不分组显示；
+    #    它是进设置后的第一屏，也是新手指引的落脚点。
+    ("base",     "基础设置",   "选一个熟悉程度：界面只显示对应的选项，改错了随时切回来。"),
     # ⚠️ 「AI 接口」这一组**只放用户真会动的**（2026-10-11 用户要求简化：
     #    「AI项中下面很多都不用出现吧」）。原来 10 项，最长输出 / 超时 /
     #    输入单价 / 输出单价**挪到「高级」**了 —— 那四项是"设完就不动"的调参，
@@ -199,6 +209,28 @@ GROUPS = [
     ("advanced", "高级",       "生成参数、读取频率、触发方式、文件位置。"
                               "平时不用动，改错会影响运行。"),
 ]
+
+
+#: 配置级别：**只决定界面上显示哪些项**，不影响已经存下来的值。
+#:
+#: ⚠️ 2026-11-08 用户要求：「设置里面多一个基础设置，有配置级别（新手/中级/高级），
+#:    用于展示不同的配置项，减少上手难度；新手可以添加指引」。
+#:    · 级别只是**过滤视图** —— 调成新手**不会**把高级项的值清掉，也不会让它们失效；
+#:    · `Setting.level` 是该设置项**第一次出现**的级别（0 = 任何级别都显示，
+#:      给「配置级别」自己用）；
+#:    · 默认级别由分组决定：`advanced` 组一律 3，其余 2（见 `Setting.__init__`）。
+LEVELS = [(1, "新手"), (2, "中级"), (3, "高级")]
+
+#: 级别 → 配置里的取值（`ui.level`）。存英文是为了让 config.yaml 里也读得懂。
+LEVEL_VALUES = {1: "novice", 2: "mid", 3: "pro"}
+
+#: 配置值 → 级别（认不出来一律当**新手**：宁可少显示，也别把新手淹了）。
+LEVEL_FROM_VALUE = {"novice": 1, "mid": 2, "pro": 3}
+
+
+def level_from_value(value) -> int:
+    """把 `ui.level` 的配置值（novice/mid/pro）换成 1/2/3。"""
+    return LEVEL_FROM_VALUE.get(str(value or "").strip().lower(), 1)
 
 
 #: 「恢复默认」时**不动的项**（2026-10-14 用户要求「恢复默认接口地址与模型不要改」）。
@@ -225,12 +257,20 @@ RESET_KEEP_LABEL = "接口地址 / 模型 / API Key / 知识库开关"
 
 
 SPEC: List[Setting] = [
+    # ---- 基础设置 ----
+    # ⚠️ `level=0`：这一项**任何级别都必须显示** —— 否则新手模式下就切不回去了。
+    Setting("ui.level", "base", "配置级别", "choice", default="novice",
+            choices=[("novice", "新手"), ("mid", "中级"), ("pro", "高级")],
+            level=0,
+            help="新手只显示最必要的几项；中级加上人设、图片识别、热键等；"
+                 "高级显示全部调参。随时可以切回来，改过的值不会丢。"),
+
     # ---- AI 接口 ----
     # ⚠️ 这一项的行内说明**是空的，别再加回去**（2026-09-27 用户要求）：
     #    原来写的是"写到 secrets.yaml（不进 Git）。界面默认打码显示。"，
     #    那是**开发者的备忘**，不是给用户看的说明 —— 用户要的是"填进去就能用"。
     #    密钥落在哪个文件、进不进 Git，是打包和仓库层面的事，不该占用界面。
-    Setting("ai.api_key", "ai", "API Key", "secret", secret=True),
+    Setting("ai.api_key", "ai", "API Key", "secret", secret=True, level=1),
     # ⚠️⚠️ **接口地址与模型的出厂值是空的**（2026-10-13 用户要求：「默认为空吧」）。
     #    原来预填 DeepSeek 的值，等于替用户选好了服务商 —— 换一家时只填 Key 会
     #    **静默打到 DeepSeek 上**（旧代码里还有硬编码兜底，见 `ai.py` 开头）。
@@ -240,10 +280,10 @@ SPEC: List[Setting] = [
             # ⚠️ help 里**不要再复述 label**（"服务商的接口地址"）——
             #    `tools/audit_ui_text.py` 第②段就是查这个，2026-10-14 报过 1 处。
             help="例如 https://api.deepseek.com。"
-                 "照服务商文档填，留空没法调用。"),
+                 "照服务商文档填，留空没法调用。", level=1),
     Setting("ai.model", "ai", "模型", "text", default="",
             help="服务商给的模型名，例如 deepseek-flash。"
-                 "填错会在生成时报错，留空没法调用。"),
+                 "填错会在生成时报错，留空没法调用。", level=1),
     # ⚠️ 2026-10-14：这一项**从「会话与记录」挪到「AI 接口」**（用户要求
     #    「把分析图片放在 AI 栏里面」）—— 它决定的是"发给模型的请求里带不带图"，
     #    是 AI 侧的开关，跟记录本身没关系。`group` 是独立字段，挪它只改这一处。
@@ -272,7 +312,8 @@ SPEC: List[Setting] = [
                  # ⚠️ 2026-10-14：「看提示词」从悬浮窗搬到了**这个窗口里**
                  #    （就挂在这一项下面），所以文案要指向"下面那颗"。
                  ),
-    Setting("ai.n_replies", "ai", "生成几条", "int", default=3, lo=1, hi=8, unit="条"),
+    Setting("ai.n_replies", "ai", "生成几条", "int", default=3, lo=1, hi=8, unit="条",
+            level=1),
     Setting("ai.max_tokens", "advanced", "最长输出", "int", default=2000, lo=64, hi=8192,
             unit="token",
             help="一次最多输出多少。模型的「思考」也算在里面 —— 调小了可能光想不答，"
@@ -304,7 +345,8 @@ SPEC: List[Setting] = [
     # ---- 外观 ----
     Setting("ui.theme", "ui", "主题", "choice", default="system",
             choices=[("system", "跟随系统"), ("dark", "深色"), ("light", "浅色")],
-            help="跟随系统 = 跟电脑的深色/浅色设置；也可以钉死成深色或浅色。"),
+            help="跟随系统 = 跟电脑的深色/浅色设置；也可以钉死成深色或浅色。",
+            level=1),
     # ⚠️ 2026-10-14 **删掉「无边框窗口」**（`ui.frameless`，用户要求「删除无边框窗口吧」）：
     #    · 关掉它只是退回**系统标题栏**（多一条丑边），而这个程序的面板是**贴边跟随**的、
     #      设置窗口也是自绘外壳 —— 关掉之后和整个界面不是一套；
@@ -325,7 +367,8 @@ SPEC: List[Setting] = [
     Setting("ui.attach", "ui", "跟随微信", "choice", default="dock",
             choices=[("dock", "贴边跟随"), ("float", "固定悬浮"), ("off", "不跟随")],
             help="贴边 = 自动站到微信旁边，位置和高度都跟着微信。"
-                 "固定悬浮 = 记住你拖的位置，跟着微信平移，不会被拉回边上。"),
+                 "固定悬浮 = 记住你拖的位置，跟着微信平移，不会被拉回边上。",
+            level=1),
     Setting("ui.dock_side", "ui", "贴哪边", "choice", default="auto",
             choices=[("auto", "自动（右→左→角落）"), ("right", "固定右侧"), ("left", "固定左侧")]),
     Setting("ui.follow_minimize", "ui", "微信最小化时一起收起", "bool", default=True),
@@ -383,10 +426,12 @@ SPEC: List[Setting] = [
 
     # ---- 会话与记录 ----
     Setting("record.enabled", "record", "静默记录", "bool", default=True, restart=True,
+            level=1,
             help="每隔几秒读一次当前会话存起来，给模型当上下文。不调 AI、不花钱、不提醒。"),
     # ⚠️ 全项目只有这一处的默认值是 **choice 而不是 bool**，因为它是三态：
     #    要不要用「截屏 + OCR」这条备用路。
     Setting("reader.backend", "record", "读取方式", "choice", default="auto", restart=True,
+            level=1,
             choices=[("auto", "自动"), ("uia", "只用微信控件"), ("ocr", "只用截图认字")],
             help="自动：先读微信自己的控件，读不到就改用截图认字。"
                  "截图认字只能看到当前一屏，也认不出图片。"),

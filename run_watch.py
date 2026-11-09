@@ -1433,8 +1433,10 @@ def main():
             msg = "%s: %s" % (type(e).__name__, e)
             log("处理失败: " + msg)
             if "COMError" in msg:
-                # UIA 的 COM 瞬态：给用户一句能懂的，原始错误看日志
-                emit("读不到微信内容（可能在重绘），稍等再点一次")
+                # UIA 的 COM 瞬态：给用户一句能懂的，原始错误看日志。
+                # ⚠️ 状态行**一行 ≤20 字**（`tools/audit_ui_text.py` 会查）——
+                #    原来那句「读不到微信内容（可能在重绘），稍等再点一次」是 21 字。
+                emit("读不到微信内容，稍等再点一次")
             else:
                 emit("处理失败: %s" % (msg[:26]))
         finally:

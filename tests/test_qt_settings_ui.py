@@ -219,12 +219,18 @@ def labels_of(root):
 
 def make_win(tmp, theme_name="dark", sessions=None, preselect=None,
              on_saved=None, modes=None, name="ct",
-             on_show_prompt=None, on_show_read=None):
-    """建一扇设置窗口（store 指向临时目录）。调用方负责 close()。"""
+             on_show_prompt=None, on_show_read=None, level="pro"):
+    """建一扇设置窗口（store 指向临时目录）。调用方负责 close()。
+
+    ⚠️ `level="pro"` 是**故意的**：这一套测试大多在验"SPEC 里的每一项都能
+       被画出来 / 布局 / 保存"，所以默认把级别拉到**高级**（全部显示）。
+       级别过滤本身由 `test_levels()` 专门验。
+    """
     from wechat_assistant.qt_ui import base
     from wechat_assistant.qt_ui.settings_ui import SettingsWindow
 
     store = make_store(tmp)
+    store.set("ui.level", level)       # 只写内存，不落盘（测试不许碰真仓库）
     cfg = store.load()
     style = base.Style(cfg, 0, name=theme_name)
     win = SettingsWindow(
@@ -1204,7 +1210,7 @@ def test_both_themes(app, tmp):
             _win._switch(gid)
             pump(app, 80)
             lay = _win.scroll.inner.layout()
-            keys = [s.key for s in SPEC if s.group == gid]
+            keys = [s.key for s in _win._visible_specs(gid)]
             ri = 0
             for i in range(lay.count()):
                 w = lay.itemAt(i).widget()
@@ -1214,7 +1220,9 @@ def test_both_themes(app, tmp):
                 #    文件清单（`settings_ui._build_kb_files`，objectName="kb-files"）。
                 #    它不是 SPEC 的一行，不能拿它去查 `SPEC_BY_KEY` ——
                 #    不跳过去的话这里会 `KeyError: '?'`（实测）。
-                if w.objectName() == "kb-files":
+                # ⚠️ 2026-11-08：「基础设置」下面同样挂了一块新手引导
+                #    （`_build_level_guide`，objectName="level-guide"），同一个理由跳过。
+                if w.objectName() in ("kb-files", "level-guide"):
                     continue
                 k = keys[ri] if ri < len(keys) else "?"
                 ri += 1
@@ -2224,6 +2232,68 @@ def test_auto_apply(app, tmp):
         safe(win.close)
 
 
+def test_levels(app, tmp):
+    """配置级别：新手 / 中级 / 高级（2026-11-08 用户要求）。
+
+    钉住的是**行为**，不是像素：
+      · 新手只显示最必要的几组（高级组整组消失）；
+      · 「配置级别」自己**任何级别都在**（否则切不回去）；
+      · 切换后**立刻**写进配置，并重建界面；
+      · 新手指引真的画出来了（用户要的"新手可以添加指引"）。
+    """
+    print("\n配置级别：新手 / 中级 / 高级")
+
+    win, store, style = make_win(tmp, level="novice")
+    try:
+        win.open()
+        pump(app, 150)
+        gids = [g[0] for g in win._visible_groups()]
+        check("新手：只留最必要的分组（没有人设 / 行为 / 知识库 / 高级）",
+              "advanced" not in gids and "persona" not in gids
+              and "kb" not in gids and "behavior" not in gids,
+              " | ".join(gids))
+        check("新手：基础设置排在第一", gids[:1] == ["base"], str(gids[:1]))
+        check("新手：「配置级别」这一项本身可见",
+              "ui.level" in win._fields, str(sorted(win._fields)))
+        texts = [w.text() for w in labels_of(win.win)]
+        check("新手：画出了「先做这两步」的指引",
+              any("先做这两步" in t for t in texts),
+              str([t for t in texts if "步" in t][:3]))
+        check("新手：AI 组只留 4 项（Key / 地址 / 模型 / 条数）",
+              len(win._visible_specs("ai")) == 4,
+              str([s.key for s in win._visible_specs("ai")]))
+        check("新手：高级组一项都没有",
+              len(win._visible_specs("advanced")) == 0,
+              str(len(win._visible_specs("advanced"))))
+
+        # ---- 切到高级：立刻写配置 + 重建（导航栏也要多出几组）
+        win._fields["ui.level"].set("pro")
+        win._on_level_changed()
+        pump(app, 200)
+        check("切到高级后，高级组出现了",
+              "advanced" in [g[0] for g in win._visible_groups()],
+              str([g[0] for g in win._visible_groups()]))
+        check("切换级别**立刻**写进了配置",
+              str(store.get("ui.level", "")) == "pro", str(store.get("ui.level")))
+        check("高级：「配置级别」仍然在（能切回来）",
+              "ui.level" in win._fields, str(sorted(win._fields)))
+        check("高级：ai 组的项数比新手多",
+              len(win._visible_specs("ai")) > 4,
+              str(len(win._visible_specs("ai"))))
+
+        # ---- 切回新手：分组要收回去（验证不是单向的）
+        win._fields["ui.level"].set("novice")
+        win._on_level_changed()
+        pump(app, 200)
+        check("切回新手后，高级组又收起来了",
+              "advanced" not in [g[0] for g in win._visible_groups()],
+              str([g[0] for g in win._visible_groups()]))
+        check("切回新手后，配置也跟着回去",
+              str(store.get("ui.level", "")) == "novice", str(store.get("ui.level")))
+    finally:
+        safe(win.close)
+
+
 def main():
     print("=" * 70)
     print("Qt 设置窗口测试")
@@ -2268,6 +2338,7 @@ def main():
         test_layout_fixes(app, tmp)
         test_textarea_resizable(app, tmp)
         test_auto_apply(app, tmp)
+        test_levels(app, tmp)
         test_no_tk_leftovers()
 
         print("\n15. 没有污染仓库")

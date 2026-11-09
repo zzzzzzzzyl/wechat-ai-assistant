@@ -63,8 +63,8 @@ from typing import Callable, Dict, Optional
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from .. import theme
-from ..settings import (GROUPS, RESET_KEEP, RESET_KEEP_LABEL, SPEC, SPEC_BY_KEY,
-                        SettingsStore, test_api)
+from ..settings import (GROUPS, LEVELS, RESET_KEEP, RESET_KEEP_LABEL, SPEC,
+                        SPEC_BY_KEY, SettingsStore, level_from_value, test_api)
 from .base import Style, qc
 from .cards import Switch
 from .inputs import EntryBox, InputBox
@@ -1257,6 +1257,13 @@ class SettingsWindow(QtCore.QObject):
         _clear_layout(win._root_lay)
         self._fields = {}
         self._nav_btns = {}
+        #: 当前配置级别（1 新手 / 2 中级 / 3 高级）—— 只决定**显示哪些项**，
+        #: 不影响已存的值是否生效（见 `settings.LEVELS`）。
+        self._level = level_from_value(self.store.get("ui.level", "novice"))
+        # 当前分组可能被这一级别过滤掉（比如新手模式下的「高级」）—— 落到第一组。
+        _groups = self._visible_groups()
+        if _groups and self._group not in [g[0] for g in _groups]:
+            self._group = _groups[0][0]
         # ⚠️ 旧面板是跟着窗口部件一起被销毁的（上面那行），引用必须一起清掉 ——
         #    否则 `_stash_session()` 会去碰一个**已经删掉的 C++ 对象**，
         #    抛的是 `RuntimeError: Internal C++ object already deleted`，
@@ -1393,7 +1400,7 @@ class SettingsWindow(QtCore.QObject):
         #    （实测 x 11~250 正好是导航栏的整幅宽度），不是缩进的小胶囊。
         nlay.setContentsMargins(0, st.px(8), 0, st.px(8))
         nlay.setSpacing(0)
-        for gid, gname, _desc in GROUPS:
+        for gid, gname, _desc in self._visible_groups():
             # ⚠️ 这里用 `navsel`（实心绿 + 近白字的**直角矩形**），
             #    不是 `selected`（淡绿底 + 绿字的胶囊）—— 见 widgets.py 的说明。
             #    初建时也要设对，不然一进来第一屏是错的。
@@ -1520,7 +1527,7 @@ class SettingsWindow(QtCore.QObject):
         self._fields = {}
 
         cfg_now = self.store.load()
-        items = [s for s in SPEC if s.group == self._group]
+        items = self._visible_specs(self._group)
         for i, spec in enumerate(items):
             self._build_row(spec, cfg_now)
             # 发丝线分隔相邻两项（微信的设置列表就是这么分的）。
@@ -1528,11 +1535,59 @@ class SettingsWindow(QtCore.QObject):
             if i < len(items) - 1:
                 self.scroll.add(hline(st))
 
+        # 「基础设置」组：级别选择器下面接一段**新手指引**
+        # （用户要求「新手可以添加指引」——新手缺的不是开关，是"先做哪一步"）。
+        if self._group == "base":
+            self.scroll.add(hline(st))
+            self.scroll.add(self._build_level_guide())
+
         # 知识库组：SPEC 只有「启用」一行，下面接一块**手写的文件清单**
         # （列表 + 按钮塞不进 SPEC 的一行一项模型，跟「会话」分组同一个理由）。
         if self._group == "kb":
             self.scroll.add(hline(st))
             self.scroll.add(self._build_kb_files())
+
+    # ------------------------------------------------------------ 级别指引
+
+    def _build_level_guide(self):
+        """「基础设置」下面那段指引 —— 按**当前级别**说不同的话。
+
+        ⚠️ 2026-11-08 用户要求「新手可以添加指引」：新手缺的不是开关数量，
+            而是"先做哪一步"。所以新手写**两步走**；中级/高级只交代一句
+            "还藏了什么 / 都在这儿了"，不给已经会的人念操作说明。
+        """
+        st = self.style
+        box = QtWidgets.QWidget(self.scroll.inner)
+        #: 测试要跳过它（它**不是** SPEC 的一行）—— 和 `kb-files` 同一个理由。
+        box.setObjectName("level-guide")
+        lay = QtWidgets.QVBoxLayout(box)
+        lay.setContentsMargins(st.S("xl"), st.S("md"), st.S("xl"), st.S("md"))
+        lay.setSpacing(st.S("xs"))
+
+        if self._level <= 1:
+            title = "新手：先做这两步就能用"
+            lines = [
+                "① 到「AI 接口」里填 API Key、接口地址、模型 —— 三样都填了才会生成。",
+                "② 回「外观」里选「跟随微信」—— 面板会自动站到微信旁边。",
+                "其余选项已经收起来了。想调的时候把上面的「配置级别」切到中级或高级，"
+                "改过的值一个都不会丢。",
+            ]
+        elif self._level == 2:
+            title = "中级：常用功能都在这里"
+            lines = [
+                "超时、刷新间隔、输出上限、文件位置这些调参项还藏在「高级」里。",
+                "切上去就能看到，切回来也不会丢设置。",
+            ]
+        else:
+            title = "高级：全部选项都已显示"
+            lines = [
+                "这些项多半设一次就不用动；改坏了在那一项右边点「恢复默认」即可。",
+            ]
+        lay.addWidget(label(st, title, font_name="body_bold", color_key="text"))
+        for ln in lines:
+            lay.addWidget(label(st, ln, font_name="small",
+                                color_key="text_dim", wrap=True))
+        return box
 
     # ------------------------------------------------------------ 会话面板
 
@@ -2057,7 +2112,9 @@ class SettingsWindow(QtCore.QObject):
         # ⚠️ `on_change` **必须传**：不传的话这一项改了不会自动生效，
         #    而且**不报错**（"静默不生效"是这个项目里最贵的一类 bug）。
         field = make_field(holder, st, spec, value,
-                           on_change=self._on_field_changed)
+                           on_change=(self._on_level_changed
+                                      if spec.key == "ui.level"
+                                      else self._on_field_changed))
         # ⚠️ **第一次见到这一项** -> 把"刚从配置填进去的"值当作**已生效的值**。
         #    必须在**建完控件之后**记（用 `field.get()`，不是 `value`）：
         #    配置里是 `2.0`、输入框里是字符串 `"2.0"`，两种类型混着比
@@ -2586,6 +2643,52 @@ class SettingsWindow(QtCore.QObject):
                 self._say("还没保存（%d 项）：%s" % (len(names), "、".join(names)))
             elif dirty:
                 self._say("会话面板的改动还没保存")
+
+    def _visible_specs(self, gid: str):
+        """这一组在**当前级别**下要显示的设置项（`level=0` 的永远显示）。"""
+        return [s for s in SPEC if s.group == gid and s.level <= self._level]
+
+    def _visible_groups(self):
+        """当前级别下左栏显示哪些分组。
+
+        ⚠️ **「会话」组任何级别都保留**：它没有 SPEC 项（是手写面板），管的是
+            "哪些会话参与、每个会话什么模式"，属于使用而非调参。
+        ⚠️ 一组项被过滤空了就**整组不隐藏掉** —— 新手模式下「高级」整组消失，
+            这就是"减少上手难度"的主要手段。
+        """
+        out = []
+        for gid, gname, desc in GROUPS:
+            if gid == "session" or self._visible_specs(gid):
+                out.append((gid, gname, desc))
+        return out
+
+    def _on_level_changed(self):
+        """「配置级别」改了 —— **立刻**落盘并重建整个窗口。
+
+        ⚠️ 不走 `_on_field_changed` 的 400ms 防抖：级别决定**左栏有哪些分组**，
+            只重建当前分组不够（导航栏也得跟着变），所以直接 `_build()`。
+        ⚠️ 级别只是**显示过滤**，不通知主程序重建 AIClient —— 值一个都没动。
+        """
+        if self.win is None:
+            return
+        try:
+            value = self._fields["ui.level"].get()
+        except Exception:
+            value = "novice"
+        try:
+            self.store.set("ui.level", value)
+            self.store.save()
+        except Exception as e:
+            self._log("保存配置级别失败: %s: %s" % (type(e).__name__, e))
+        self._seen["ui.level"] = value
+        self._base["ui.level"] = value
+        try:
+            self._build()
+        except Exception as e:
+            self._log("按新级别重建设置界面失败: %s: %s" % (type(e).__name__, e))
+            return
+        name = dict(LEVELS).get(level_from_value(value), "新手")
+        self._say("已切换到「%s」" % name)
 
     def _notify(self):
         if self._on_saved:
