@@ -357,6 +357,12 @@ class AIClient:
             "total_tokens": usage.get("total_tokens", 0),
             # 其中有多少是「思考」花的 —— 实测能占到输出的八成
             "reasoning_tokens": _details.get("reasoning_tokens", 0),
+            # ⚠️ 2026-11-09：**前缀缓存**是否命中（DeepSeek 这类服务商会在
+            #    usage 里回这两个字段；不支持的厂商就是 0）。
+            #    为什么值得记：输入占成本约 64%，而缓存命中价通常只有 1/10 ——
+            #    没有这两个数，就永远不知道"把口吻样本挪到最后"到底赚了没有。
+            "cache_hit_tokens": usage.get("prompt_cache_hit_tokens", 0) or 0,
+            "cache_miss_tokens": usage.get("prompt_cache_miss_tokens", 0) or 0,
         }
         self.total_usage["calls"] += 1
         for k in ("prompt_tokens", "completion_tokens", "total_tokens"):

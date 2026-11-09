@@ -1419,6 +1419,12 @@ def main():
                     _money = ("（约 ¥%.4f）" % _cost) if (p_in or p_out) else ""
                     _rt = _u.get("reasoning_tokens", 0)
                     _extra = ("，其中思考 %d" % _rt) if _rt else ""
+                    # ⚠️ 2026-11-09：**前缀缓存**命中量（服务商不回就是 0）。
+                    #    输入占成本约 64%，缓存命中价通常 1/10 —— 不记这个就看不出
+                    #    "把口吻样本挪到最后"到底有没有赚。
+                    _hit = _u.get("cache_hit_tokens", 0)
+                    if _hit:
+                        _extra += "，缓存命中 %d" % _hit
                     log("本次用量: 入 %d + 出 %d = %d token%s%s"
                         % (_u["prompt_tokens"], _u["completion_tokens"],
                            _u["total_tokens"], _extra, _money))

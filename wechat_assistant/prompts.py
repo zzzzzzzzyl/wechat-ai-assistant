@@ -22,6 +22,9 @@
     {intent}        「我想说」—— 没填时**整块为空**
     {n}             要写几条候选
 
+    ⚠️ `{style}` 虽然写在上面这个清单里，但 `render_system` 会把它**排到最后**
+        （它是变化最频繁的一块，放前面会让服务商的前缀缓存全废）。
+
     上面三个"整块为空"的占位符，展开时**自带结尾的空行**（非空时），
     所以默认模板里把它们直接挨着写就行，不用手工调空行。
 """
@@ -192,12 +195,19 @@ DEFAULT_SYSTEM_TEMPLATE = """【硬性禁止，必须遵守】
 5.上下文可能会有乱码与识别错误的字段，判断后可忽略。
 6.消息可能来自群聊，需要分辨发言角色；标记为「我:」的消息是我方历史发言，属于背景，不是对方消息，不要当成待回复内容。若整屏只有「我:」的消息，就顺着上一句往下接。"""
 
-#: 拼在**用户正文之前**的那一段：人设 / 关系 / 口吻样本。
-#: ⚠️ 这些在设置里各有自己的项（「人设与口吻」分组），所以**不该**再出现在
-#:    提示词那个框里 —— 那样等于同一个东西有两处可改，必然漂。
+#: 拼在**用户正文之前**的那一段：人设 / 关系。
+#:
+#: ⚠️⚠️ 2026-11-09 用户报「LLM 调用的工程逻辑」→ 优化命令：**前缀缓存**。
+#:    原来这里是 `{persona}\n\n{relationship}{style}` —— **口吻样本夹在关系后面**。
+#:    而口吻样本来自"我最近发过的短消息"，**每次生成都可能变**；它一变，
+#:    后面几百字的用户规则 + 输出要求**全部失效**，服务商的前缀缓存一次也命中不了。
+#:    实测（今天 18 次调用）：输入 821 token/次、占成本 **64%**，
+#:    其中 system 880 字是主体 —— 每次全量重发太亏。
+#:    → 现在 `{style}` **挪到最末尾**（输出要求之后，见 `render_system`），
+#:      前面的人设 + 关系 + 用户规则 + 输出要求变成**稳定前缀**，可被缓存命中。
 PREFIX_TEMPLATE = """{persona}
 
-{relationship}{style}"""
+{relationship}"""
 
 #: 拼在**用户正文之前**（紧跟 PREFIX）的「我想说」块。
 #:
@@ -229,13 +239,14 @@ def render_system(user_text: str, persona: str = "", relationship: str = "",
         （【硬性禁止】+【上下文规则】）。人设 / 关系 / 口吻 /「我想说」/
         输出格式由这里在**外面**拼 —— 用户要求「框里只放那两段」。
 
-    拼的顺序：
+    拼的顺序（2026-11-09 起 `{style}` 在最后，为了**前缀缓存**）：
 
         {persona}
-        {relationship}{style}
+        {relationship}
         {intent}                 <- 「我想说」，有才拼
         <user_text>              <- **用户可改的那一段**
         OUTPUT_SPEC              <- 输出格式（代码侧，含 {n}）
+        {style}                  <- 口吻样本（变化最频繁的一块，放最后）
 
     ⚠️⚠️ **只用 `str.replace()`，绝不用 `str.format()` / `%`。**
         正文里有 JSON 花括号（`{"intent": ...}`），用户也可能往里粘代码 ——
@@ -262,11 +273,15 @@ def render_system(user_text: str, persona: str = "", relationship: str = "",
     step2 = (STEP2_INTENT if user_intent else STEP2_NORMAL).replace(
         "{n}", str(n_replies))
 
-    # 拼：前缀 + 我想说 + 用户正文 + 输出格式（输出格式在代码侧，用户改不到）
-    # ⚠️ 他要是自己在正文里写了 `{intent}`，就按他放的位置来 ——
+    # 拼：人设/关系 + 我想说 + 用户正文 + 输出要求 + **口吻样本（放最后）**。
+    # ⚠️ 2026-11-09：`{style}` 从"关系后面"挪到**最末尾** —— 见 `PREFIX_TEMPLATE`
+    #    的说明（口吻样本每次都变，放前面会把后面整段稳定前缀的缓存全废掉）。
+    #    放末尾还有个附带好处：样本离"要写的回复"更近，模仿得更容易生效。
+    # ⚠️ 他要是自己在正文里写了 `{intent}` / `{style}`，就按他放的位置来 ——
     #    那时**不要再拼一份**，否则同一段出现两次。
     head = PREFIX_TEMPLATE + ("" if "{intent}" in body else it)
-    out = head + body + "\n\n" + OUTPUT_SPEC
+    tail = "" if "{style}" in body else sty
+    out = head + body + "\n\n" + OUTPUT_SPEC + (("\n\n" + tail) if tail else "")
     out = out.replace("{step2}", step2)
     out = out.replace("{n}", str(n_replies))
     out = out.replace("{persona}", (persona or "").strip() or "你是一个聊天助手。")

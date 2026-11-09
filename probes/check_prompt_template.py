@@ -120,7 +120,13 @@ def main():
     check("关系拼上了", "【你们的关系】关系R" in got)
     check("口吻样本拼上了（防 AI 腔最有效的一环，**别丢**）", "样本S" in got)
     check("「我想说」拼上了", "意图I" in got)
-    check("输出要求在**最后**", got.rstrip().endswith("单语气词"))
+    # ⚠️ 2026-11-09 顺序改了（**前缀缓存**）：口吻样本挪到最末尾，
+    #    输出要求不再"最后一个"，而是"在正文之后、样本之前"。
+    check("输出要求在正文之后（不是最后一个了）", got.rstrip().endswith("单语气词")
+          is False and "【输出要求】" in got)
+    check("口吻样本在**最后**（它变化最频繁，放前面会废掉前缀缓存）",
+          got.rstrip().endswith("）") and got.rstrip().rfind("样本S") > got.rfind("【输出要求】"),
+          got.rstrip()[-30:])
     check("没给关系 -> 整块为空", "【你们的关系】" not in empty)
     check("没给样本 -> 整块为空", "照着模仿" not in empty)
     check("没填我想说 -> 整块为空", "最高优先级" not in empty)

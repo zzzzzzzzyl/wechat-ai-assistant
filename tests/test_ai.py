@@ -85,9 +85,14 @@ def test_prompt_template():
     check("  没留下未替换的占位符",
           all(k not in got for k in ("{persona}", "{relationship}", "{style}",
                                      "{intent}", "{n}", "{step2}")))
-    # 顺序：人设在最前、输出要求在最后
+    # 顺序：人设最前；**口吻样本最后**（2026-11-09 为前缀缓存挪过去的），
+    # 输出要求在正文之后、样本之前。
     check("  人设在最前面", got.startswith("人设P"))
-    check("  输出要求在最后", got.rstrip().endswith("单语气词"), repr(got[-24:]))
+    check("  输出要求在正文之后、样本之前",
+          got.rfind("【输出要求】") > got.find("【硬性禁止，必须遵守】")
+          and got.rfind("【输出要求】") < got.rfind("样本S"), repr(got[-40:]))
+    check("  口吻样本在**最后**（变化最频繁，放前面会废掉前缀缓存）",
+          got.rstrip().endswith("）"), repr(got[-24:]))
 
     # 没给的那几块要**整块为空**（不是留下空标题）
     bare = prompts.render_system(prompts.DEFAULT_SYSTEM_TEMPLATE, persona="人设")
