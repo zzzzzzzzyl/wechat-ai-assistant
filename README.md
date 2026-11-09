@@ -3,7 +3,7 @@
 Windows 上的本地帮你思考草稿工具：读你**当前**微信对话，根据上下文按你的说话习惯生成三条可以直接发出去的回复，显示在自己的小窗口里 —— 复制、粘贴、发送全部由你手动完成。
 
 - **下载（Windows 10/11 64 位）**：[GitHub Releases](https://github.com/zzzzzzzzyl/wechat-ai-assistant/releases)
-  → `wechat-ai-assistant-win64.zip`（约 127 MB，解压后 293 MB，不需要装 Python）
+  → `wechat-ai-assistant-win64.zip`（约 128 MB，解压后 295 MB，不需要装 Python）
 - **使用介绍页**：[zzzyl.xyz/projects/wxai](https://zzzyl.xyz/projects/wxai/)
 
 TX规定不可以做自动化工具：
