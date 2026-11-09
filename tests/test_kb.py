@@ -219,6 +219,31 @@ def test_search(kb):
           kb.search("怎么改变") == [], "-> %r" % kb.search("怎么改变"))
     check("7j 和资料毫无关系的问法 → 返回空",
           kb.search("合力的大小是不是会随着分力角度的改变而改变") == [])
+    # ⚠️⚠️ 2026-10-17 用户实测：对方只发了一串 `000000`，
+    #    【参考资料】却给出了"选题报告 / 复杂度分析"。两个漏洞叠在一起：
+    #      ① 纯数字查询也去查（"000000"、"0"、"1" 都能捞到日期编号）；
+    #      ② 二字组没去重 → 5 个重复的 "00" 让覆盖率算成 5，白骗过门槛。
+    # ⚠️ 判定靠**统计**（查询里有没有"稀有词"），不靠"是不是数字" ——
+    #    统计量要有样本才成立（`MIN_DF_CORPUS`），所以在**够大的库**上验。
+    _d = os.path.dirname(kb.path)
+    big_path = os.path.join(_d, "kb_big.db")
+    kb_big = kb_mod.KnowledgeBase(big_path)
+    for i in range(40):
+        _write(_d, "填充%02d.md" % i,
+               "## 填充%d\n第 %d 号填充资料，用于把库撑到统计有效的规模。\n" % (i, i))
+        kb_big.add_document(os.path.join(_d, "填充%02d.md" % i))
+    kb_big.add_document(os.path.join(_d, "价目表.txt"))
+    check("7k 纯数字查询 → 不查（**库里没有哪片把它当主题词**）",
+          kb_big.search("000000") == [] and kb_big.search("0") == []
+          and kb_big.search("2026") == [],
+          "-> %r / %r / %r" % (kb_big.search("000000"), kb_big.search("0"),
+                               kb_big.search("2026")))
+    check("7k2 但大库里正常问法照样中（门槛不是把库「关掉」）",
+          bool(kb_big.search("定金能退吗")), "-> %r" % (kb_big.search("定金能退吗"),))
+    check("7l 同一个词重复的一串 → 不查（没有信息量）",
+          kb.search("哈哈哈哈哈") == [])
+    check("7m 但正常的短词照样查（「定金」这种 2 字实义词）",
+          bool(kb.search("定金")), "-> %r" % (kb.search("定金"),))
     check("7g 相对门槛：首位很干净时噪声片被剪掉",
           len(kb.search("A2 耐温 -20℃", top_k=3, min_ratio=0.6)) <= 2,
           "-> %d 片" % len(kb.search("A2 耐温 -20℃", min_ratio=0.6)))

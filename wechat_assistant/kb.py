@@ -47,6 +47,7 @@
 """
 import hashlib
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -80,6 +81,25 @@ DEFAULT_CHUNK_CHARS = 400
 #:      覆盖率 0.3 + 至少 3 个 → 该中的 **19/19**，不该中的 **1/10**
 #:    单用"至少 2 个"不行（虚词凑得出 2 个），单用 0.34 会误杀两条真命中。
 MIN_COVERAGE = 0.3
+
+#: **查询里至少要有一个"稀有词"**：它出现在少于这个比例的片里，才有检索价值。
+#:
+#: ⚠️⚠️ 为什么用它，而不是"纯数字不查"这种字形规则（2026-10-17 用户实测 + 用户要求
+#:    "该怎么优化，而不是通过规避词来避免"）：
+#:    对方只发 `000000`，二字组是重复的 `00` —— 它**不是"数字"所以没用**，
+#:    而是**在库里到处都是（日期、编号、百分比），所以不携带信息**。
+#:    同理「怎么」也是高频虚词。用**文档频率**判"这个词能不能当证据"，
+#:    对任何语言、任何库都成立，而且不需要维护停用词表。
+#:    实测（examples 语料 43 片）：df 上限 5% → 该中的 19/19，不该中的 1/15。
+#:    `000000` / `0` / `1` / `2026` / `哈哈哈哈哈` 全部自然地被挡掉。
+MIN_DF_RATIO = 0.05
+
+#: 库小于这么多片时**不做**稀有词判定。
+#:
+#: ⚠️ 为什么：一共才 5~10 片时，每个词都"出现在好几片里"，df 已经没有区分力 ——
+#:    这时候拿它当门槛只会把**正常查询**也挡掉（实测：小库上召回直接掉到 0）。
+#:    统计量要有意义，样本得够；小库靠后面的覆盖率门槛兜着。
+MIN_DF_CORPUS = 30
 
 #: 命中数下限。**分长短查询**（实测出来的，别合并成一个数）：
 #:   · 查询短（<6 个二字组）→ 2 个就够（"A2 耐温多少"这种 5 个组、真命中 2 个）；
@@ -492,6 +512,7 @@ class KnowledgeBase:
                  min_coverage: float = MIN_COVERAGE,
                  min_hits: int = MIN_HITS,
                  min_hits_short: int = MIN_HITS_SHORT,
+                 min_df_ratio: float = MIN_DF_RATIO,
                  logger: Callable[[str], None] = None):
         self.path = os.path.abspath(path or paths.resolve("state", "kb.db"))
         self.chunk_chars = int(chunk_chars)
@@ -503,6 +524,8 @@ class KnowledgeBase:
         self.min_coverage = float(min_coverage)
         self.min_hits = int(min_hits)
         self.min_hits_short = int(min_hits_short)
+        #: 查询里至少有一个词的 df 要低于这个比例（见 `MIN_DF_RATIO`）
+        self.min_df_ratio = float(min_df_ratio)
         self._log = logger or (lambda msg: None)
         self._lock = threading.Lock()
         self._ensure_schema()
@@ -979,9 +1002,15 @@ class KnowledgeBase:
         expr = build_query(query)
         if not expr:
             return []
-        # 覆盖率的分母：查询切出来的二字组（和 `build_query` 用同一份，别各算一次）
-        grams = [g for g in bigrams(sanitize_query(query)).split()
-                 if g.strip()][:12]
+        # ⚠️ 索引里存的是**二字组**：一个字的查询根本切不出二字组
+        #    （"0" 会被当成一个长度 1 的"二字组"，纯属巧合命中）。没有检索单元 → 不查。
+        if len(sanitize_query(query)) < 2:
+            self._log("[KB] 查询只有 1 个字，没有可检索的二字组，这次不查")
+            return []
+        # 覆盖率的分母：查询切出来的二字组 —— ⚠️ **必须去重**
+        #   （把 "000000" 切成 5 个 "00" 会让覆盖率算成 5，白骗过门槛）
+        grams = list(dict.fromkeys(
+            g for g in bigrams(sanitize_query(query)).split() if g.strip()))[:12]
         if not grams:
             return []
         # ⚠️ 下限**分长短查询**（理由见 `MIN_HITS_SHORT` / `MIN_HITS` 那两段实测），
@@ -994,6 +1023,26 @@ class KnowledgeBase:
             with self._lock:
                 con = self._connect()
                 try:
+                    # ⚠️ **稀有词判定**（见 `MIN_DF_RATIO`）：查询里一个罕见词都没有
+                    #    （"000000"、"怎么改变" 这种只有常用字的），检索出来必然是噪声 ——
+                    #    宁可这次不查，也不要凑几条不相干的资料。
+                    total = con.execute(
+                        "select count(*) from kb_chunks").fetchone()[0] or 1
+                    if total >= MIN_DF_CORPUS:
+                        cap = max(2, int(-(-total * self.min_df_ratio // 1)))
+                        rarest = None
+                        for g in grams:
+                            df = con.execute(
+                                "select count(*) from kb_index where grams match ?",
+                                ('"%s"' % g.replace('"', '""'),)).fetchone()[0]
+                            if rarest is None or df < rarest:
+                                rarest = df
+                            if rarest <= cap:
+                                break
+                        if rarest is not None and rarest > cap:
+                            self._log("[KB] 查询里没有罕见的词（最稀的出现于 %d/%d 片），"
+                                      "这次不查" % (rarest, total))
+                            return []
                     rows = con.execute(
                         "select d.name, c.crumb, c.text, bm25(kb_index)"
                         " from kb_index"

@@ -1150,7 +1150,6 @@ def main():
             #   messages（旧）: 可见历史 + 库里最近 N 条，按重叠点合并。
             max_ctx = ai.max_messages if ai is not None else 20
             history = None
-            gap_seen = False
             if screens is not None:
                 key = registry.key_for(sess)
                 items, gap = screens.stitch(
@@ -1192,12 +1191,17 @@ def main():
                     except Exception:
                         pass
                     if gap:
-                        log("屏快照：缝合时有屏接不上（中间可能有没看到的内容）")
-                        # ⚠️ 2026-10-17：**断口要告诉模型**，不能只写日志。
-                        #    只写日志的话，模型会把断口两侧硬接成连续对话。
-                        #    ⚠️ 标记**不能在这里插** —— 下面 `history[-max_ctx:]`
-                        #       会把它切掉（它在队首）。统一在截断之后插。
-                        gap_seen = True
+                        # ⚠️⚠️ 2026-11-09 用户报「对话历史里一直有『中间有一段没读到，
+                        #    别硬接』」—— 这句**不再进提示词**，只留日志。
+                        #    理由（实测见 `window.stitch_frames` 里 `gap =` 那段注释）：
+                        #    · `merged` 是"重叠 ≥1 条才拼"长出来的，**它自己一定连续**；
+                        #    · 而"更老的屏接不上"是常态（翻过历史 / 隔了几小时），
+                        #      19 个会话里 15 个 gap=True（79%）——
+                        #      标记几乎每次都出现，模型反而以为上下文断了、回答变保守。
+                        #    真缺一段是**判不出来**的（三种判据都还在 40% 以上，
+                        #    翻屏的旁支屏和真缺口长得一样），宁可不报也别每次报废话。
+                        log("屏快照：有屏没缝进去（多半是翻过历史/隔得久的旧屏，"
+                            "不代表上下文断了）")
                     # 切段是**有意为之**，别让它静默发生 —— 用户得知道
                     # "为什么这次的历史比上次短"
                     if items and is_time_item(items[0]) and items[0].get("date"):
@@ -1214,15 +1218,9 @@ def main():
                                                         int(cfg.get("reply.history_messages", 40)))]
                 history = merge_with_store(visible_history, stored, max_ctx)
             else:
-                # ⚠️ 断口标记要**算在 max_ctx 里面**：`render_history` 还会再取一次
-                #    「最近 20 条」，插在队首的标记会被切掉 → 等于没提示。
-                if gap_seen and history:
-                    history = history[-(max_ctx - 1):] if len(history) >= max_ctx \
-                        else history
-                    history.insert(0, {"who": "",
-                                       "text": "……中间有一段没读到，别硬接……"})
-                else:
-                    history = history[-max_ctx:]
+                # 2026-11-09：不再插「中间有一段没读到」标记（见上面 `if gap:` 的说明）。
+                # `merged` 本身是连续的，标记只是在每次生成时多塞一句让人泄气的话。
+                history = history[-max_ctx:]
 
             # ⚠️ 2026-10-17：**标出真正要回的那条**（`>> `）。
             #    用户反馈「明明有上下文，它只盯着最后一两条无关紧要的说」——

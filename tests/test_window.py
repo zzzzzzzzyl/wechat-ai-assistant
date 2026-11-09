@@ -518,6 +518,32 @@ def test_no_scatter():
     check("没有缺口", gap3, False)
 
 
+def test_no_gap_marker():
+    """2026-11-09：**不再往历史里插「中间有一段没读到，别硬接」**。
+
+    用户报「对话历史里一直有这句」。查下来：`gap=True` 在 19 个会话里占 15 个（79%）
+    —— 因为"更老的屏接不上"是常态，而 `merged` 本身靠重叠拼出来、**一定是连续的**。
+    标记几乎每次出现，只会让模型以为上下文断了。
+
+    这条用静态检查钉住：`run_watch.py` 里不许再出现那句话。
+    """
+    print("\n20. 历史里不再插「别硬接」标记")
+    import io
+    import os
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    src = io.open(os.path.join(here, "..", "run_watch.py"), encoding="utf-8").read()
+    # ⚠️ 注释里**可以**留下"为什么删掉它"的说明，所以只查**非注释行**。
+    code_lines = [ln for ln in src.splitlines()
+                  if not ln.lstrip().startswith("#")]
+    check_true("run_watch 的**代码**里没有那句标记",
+               not any("别硬接" in ln for ln in code_lines))
+    check_true("也没再往 history 队首插占位行", 'history.insert(0, {"who": ""' not in src)
+    _items, _gap = stitch_frames([[{"text": "a"}], [{"text": "b"}]])
+    check_true("stitch 仍然返回 (items, bool) —— gap 只是统计量",
+               isinstance(_gap, bool), repr(_gap))
+
+
 def main():
     print("=" * 70)
     print("屏快照存储 + 缝合算法 单元测试")
@@ -548,6 +574,7 @@ def main():
         test_collapse_basic()
         test_collapse_in_stitch(st)
         test_no_scatter()
+        test_no_gap_marker()
     finally:
         st.close()
         try:

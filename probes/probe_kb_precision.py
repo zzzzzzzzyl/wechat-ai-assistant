@@ -20,7 +20,8 @@
 - `min2`      : 至少要命中 **2 个不同**的二字组（查询本身不足 2 个就按 1 个算）
 - `cov`       : 命中覆盖率 ≥ 34%（命中数 / 查询二字组数）
 - `df+min2`   : 上面两条一起
-- `final`     : **产品里用的** = 覆盖率 0.3 + 「短查询命中≥2 / 长查询命中≥3」
+- `final`     : **产品里用的** = ① 二字组去重 ② 查询里至少有一个"稀有词"
+  （df ≤ 5% 的片，且库 ≥30 片）③ 覆盖率 0.3 + 「短查询命中≥2 / 长查询命中≥3」
   （实测：示例语料上"该中的 19/19、不该中的 1/10"；只用比例分不开
    「怎么改变」1/3 和「文档拆多长」3/9 —— 两者都是 0.33，得靠**绝对个数**）
 
@@ -66,6 +67,8 @@ BAD = [
     "对抗训练怎么做", "怎么用 Docker 部署模型",
     "紫砂壶怎么开壶", "明天天气怎么样", "红烧肉要炖多久",
     "这个月业绩能完成吗", "怎么提高睡眠质量",
+    # 2026-10-17 用户实测：对方只发了一串数字 → 【参考资料】给出"选题报告/复杂度分析"
+    "000000", "0", "1", "2026", "哈哈哈哈哈",
 ]
 
 # ---------------------------------------------------------------- 门槛
@@ -90,9 +93,10 @@ def total_chunks(con):
 
 def pick(con, query, strategy, fetch=24, top_k=3, min_ratio=0.6,
          df_ratio=0.05, cov_ratio=0.3):
-    """按某种门槛检索 → [(doc, crumb, score)]（已经过剪枝）。"""
-    q = K.sanitize_query(query)
-    grams = [g for g in K.bigrams(q).split() if g.strip()][:12]
+    clean = K.sanitize_query(query)
+    grams = [g for g in K.bigrams(clean).split() if g.strip()][:12]
+    if strategy == "final" and len(clean) < 2:
+        return []                            # 一个字的查询切不出二字组
     if not grams:
         return []
     use = list(grams)
@@ -103,6 +107,12 @@ def pick(con, query, strategy, fetch=24, top_k=3, min_ratio=0.6,
         use = [g for g in grams if dfs.get(g, 0) <= cut]
         if not use:
             return []
+    if strategy == "final":
+        total = total_chunks(con)
+        if total >= 30:
+            cap = max(2, int(-(-total * 0.05 // 1)))
+            if min(df_map(con, use).values()) > cap:
+                return []                    # 查询里没有罕见词 → 不查
     expr = " OR ".join('"%s"' % g for g in use)
     rows = con.execute(
         "select d.name, c.crumb, c.text, bm25(kb_index) s from kb_index"
