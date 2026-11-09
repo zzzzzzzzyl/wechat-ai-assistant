@@ -390,23 +390,27 @@ from .winlocate import list_windows, pick_window  # noqa: E402,F401
 _IMAGE_PLACEHOLDER = "[图片]"
 
 #: 发给模型的图压缩到长边多少（和 OCR 那边一致）。
+#: ⚠️ 2026-11-09：缩图/编码统一走 `capture.encode_for_model()`（JPEG + 体积预算），
+#:    这里不再自己 `resize` + `save(PNG)` —— 常量保留只为兼容老引用。
 _IMG_MAX_SIDE = 1024
 
 
-def _crop_images_from_window(hwnd: int, rects) -> List[str]:
+def _crop_images_from_window(hwnd: int, rects, limit: int = None,
+                             logger=None) -> List[str]:
     """按**屏幕坐标**抓一张窗口位图，裁出图片消息的本体（base64）。
 
     ⚠️ UIA 后端**从来不抓图**（它只读控件树），而图片消息的
         `rect` 是**屏幕坐标** —— 所以要现抓一张才能裁。
     ⚠️ 只在 `ocr_read.attach_image` 打开时被调到（关着时**一行都不走**）。
-    ⚠️ 和 OCR 那边同一套取舍：**只发图片消息**（不发整屏）、
-        压缩到长边 1024、**一张一条**。
+    ⚠️ 2026-11-09：**加了两道上限**（原来只有"长边 1024"）：
+        · **张数**：`ocr_read.max_images`（默认 3），只发**最近**的几张
+          （rects 是按屏上顺序来的，后面的是更靠下的 = 更新的）；
+        · **体积**：统一走 `capture.encode_for_model()` —— JPEG + 300KB 预算，
+          不再存 PNG（照片类 PNG 能到 1~2MB，视觉模型按图算 token）。
     """
-    import base64
-    import io as _io
-
     from . import capture
 
+    log = logger or (lambda m: None)
     try:
         wrect = win32gui.GetWindowRect(hwnd)
     except Exception:
@@ -414,18 +418,23 @@ def _crop_images_from_window(hwnd: int, rects) -> List[str]:
     img = capture.capture_window(hwnd)
     if img is None or capture.is_blank(img):
         return []
+    rects = list(rects or [])
+    if limit is None:
+        limit = capture.IMG_MAX_COUNT
+    limit = int(limit)
+    skipped = max(0, len(rects) - limit) if limit > 0 else 0
+    if limit > 0:
+        rects = rects[-limit:]
     out = []
     for r in rects:
         sub = capture.crop_window_region(img, wrect, r)
         if sub is None or sub.width < 8 or sub.height < 8:
             continue
-        w, h = sub.size
-        k = min(1.0, float(_IMG_MAX_SIDE) / max(w, h))
-        if k < 1.0:
-            sub = sub.resize((max(1, int(w * k)), max(1, int(h * k))))
-        buf = _io.BytesIO()
-        sub.convert("RGB").save(buf, format="PNG")
-        out.append(base64.b64encode(buf.getvalue()).decode("ascii"))
+        out.append(capture.encode_for_model(sub))
+    if out:
+        log("附带 %d 张图片给模型看（约 %d KB）%s"
+            % (len(out), capture.kb_of(out),
+               ("，另有 %d 张没发（上限 %d）" % (skipped, limit)) if skipped else ""))
     return out
 
 
@@ -730,7 +739,10 @@ class WeChatReader:
             #    关着时**一行都不走**（不抓图、不编码）。
             #    ⚠️ UIA 本来是**不抓图**的，这是它唯一会抓图的地方。
             if image_rects and self.cfg.get("ocr_read.attach_image"):
-                snap.images = _crop_images_from_window(hwnd, image_rects)
+                snap.images = _crop_images_from_window(
+                    hwnd, image_rects,
+                    limit=self.cfg.get("ocr_read.max_images", None),
+                    logger=self._log)
             label_unknown_senders(snap)
             return snap
 

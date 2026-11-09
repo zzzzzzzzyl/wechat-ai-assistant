@@ -14,11 +14,73 @@ from .textfilter import is_noise_text
 
 
 import json
+import random
+import time
 import urllib.error
 import urllib.request
 from typing import Callable, Dict, List, Optional
 
 from . import prompts
+
+# ---------------------------------------------------------------- 重试与错误码
+#
+# ⚠️ 2026-11-09 用户问「有没有失败重试、错误码处理」—— 原来两样都没有：
+#    一次 `urlopen`，任何失败都直接变成 `AIError("HTTP %s: %s")` 甩到界面上。
+#    429 限流 / 5xx / 连接被掐，全都当**最终失败**，用户只能自己再点一次
+#    （点的时候 busy 可能还没清）。
+
+#: 这些状态码**值得重试**（服务端瞬态 / 限流）。
+#: ⚠️ 400/401/403/404/422 一律**不重试**：参数或鉴权错了，重试只是再错一遍。
+RETRY_CODES = frozenset({408, 425, 429, 500, 502, 503, 504})
+
+#: 第 1 / 2 次重试前等多久（秒）。3 次尝试之后就放弃。
+RETRY_BACKOFF = (0.6, 1.8)
+
+#: 一次调用（含重试）的**总时间预算**。超过就不再重试 ——
+#: 否则 `ai.timeout=60` × 3 次 = 3 分钟，界面看起来像卡死。
+RETRY_BUDGET_S = 90.0
+
+#: 只有**这次尝试本身很快失败**（< 这个秒数）才重试。
+#:
+#: ⚠️ 反例：`timeout=60` 的超时说明链路很差，再等 60 秒 ×2 只会让界面像卡死。
+#:    429 / 5xx 都是"服务端立刻回一个错误"，耗时才几百毫秒 → 值得重试。
+RETRY_FAST_S = 15.0
+
+#: 单次重试最多等多久（服务端给了 `Retry-After` 也不能把我们挂太久）。
+RETRY_WAIT_MAX = 8.0
+
+#: HTTP 状态码 → **给用户看的一句话**（≤20 字，不含内部细节）。
+#: ⚠️ 界面只显示这句；原始 body 放在 `AIError.detail` 里**只进日志**
+#:    （body 里可能有 Key 片段、超长 JSON、服务商内部 id）。
+HTTP_HINTS = {
+    400: "请求被拒（内容可能太长）",
+    401: "API Key 无效或已过期",
+    402: "余额不足或未开通",
+    403: "没有权限（Key 或地区）",
+    404: "接口地址或模型名不对",
+    408: "请求超时",
+    413: "请求太大（图太多或太长）",
+    422: "参数不被接受（模型不支持看图？）",
+    429: "请求太频繁，稍等再试",
+    500: "服务端出错",
+    502: "服务端网关错误",
+    503: "服务暂时不可用",
+    504: "服务端超时",
+}
+
+
+def explain_http_error(code, body: str = ""):
+    """把 HTTP 状态码翻成 (给用户看的一句话, 原始细节)。
+
+    ⚠️ `settings.test_api`（「测试连接」按钮）和生成路径**共用这一个函数** ——
+        原来两套写法：按钮有中文分类，生成路径直接甩 `HTTP 500: {...}`。
+    """
+    try:
+        c = int(code)
+    except Exception:
+        c = 0
+    hint = HTTP_HINTS.get(c) or ("接口返回 %s" % (code,))
+    return hint, (body or "")
 
 # ⚠️ **不再有"默认接口地址 / 默认模型"这种兜底**（2026-10-13 用户要求：
 #    「接口地址与模型默认为空」）。
@@ -77,7 +139,19 @@ def collect_style_samples(messages, limit: int = 12, max_len: int = 60,
 
 
 class AIError(RuntimeError):
-    """AI 调用失败。"""
+    """AI 调用失败。
+
+    属性（2026-11-09 加）：
+        code      HTTP 状态码；网络层错误是 None
+        detail    **原始**响应 body / 异常文本 —— **只进日志，不上界面**
+        retriable 这类错误重试过也失败了吗（决定日志措辞，不影响界面）
+    """
+
+    def __init__(self, message, code=None, detail: str = "", retriable: bool = False):
+        super().__init__(message)
+        self.code = code
+        self.detail = detail
+        self.retriable = retriable
 
 
 class AIClient:
@@ -150,24 +224,79 @@ class AIClient:
     def available(self) -> bool:
         return not self.missing
 
+    def _retry_wait(self, err, attempt: int) -> float:
+        """这次重试要等多久：优先听服务端 `Retry-After`，否则指数退避 + 抖动。"""
+        wait = float(RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)])
+        try:
+            if err is not None:
+                ra = err.headers.get("Retry-After") if getattr(err, "headers", None) else None
+                if ra:
+                    wait = float(str(ra).strip())
+        except Exception:
+            pass
+        wait = max(0.0, min(wait, RETRY_WAIT_MAX))
+        return wait + random.uniform(0, 0.25)      # 抖动：避免多实例同时重试
+
     def _post(self, path: str, payload: dict) -> dict:
+        """POST 一次；对**瞬态**失败自动重试（见 `RETRY_CODES` / `RETRY_BUDGET_S`）。
+
+        ⚠️ 2026-11-09 **新增重试**：原来一次 `urlopen` 失败就直接抛，429/5xx
+            只能说"请求失败"，用户得自己再点一次。
+        ⚠️ 重试要讲规矩：只重试**幂等且瞬态**的（429/5xx/网络），
+            400/401/403/404/422 重试一遍还是同样的错，立刻抛。
+        ⚠️ 总预算 `RETRY_BUDGET_S`：`timeout=60` 时 3 次尝试能到 3 分钟，
+            界面看起来像卡死 —— 超过预算就不再重试。
+        """
         url = self.base_url + path
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        req = urllib.request.Request(url, data=data, method="POST")
-        req.add_header("Content-Type", "application/json; charset=utf-8")
-        req.add_header("Authorization", "Bearer " + self.api_key)
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as r:
-                return json.loads(r.read().decode("utf-8"))
-        except urllib.error.HTTPError as e:
-            body = ""
+        started = time.monotonic()
+        attempt = 0
+        while True:
+            req = urllib.request.Request(url, data=data, method="POST")
+            req.add_header("Content-Type", "application/json; charset=utf-8")
+            req.add_header("Authorization", "Bearer " + self.api_key)
+            req.add_header("User-Agent", "wechat-ai-assistant (local)")
+            t0 = time.monotonic()
             try:
-                body = e.read().decode("utf-8", "ignore")[:400]
-            except Exception:
-                pass
-            raise AIError("HTTP %s: %s" % (e.code, body)) from e
-        except Exception as e:
-            raise AIError("%s: %s" % (type(e).__name__, e)) from e
+                with urllib.request.urlopen(req, timeout=self.timeout) as r:
+                    return json.loads(r.read().decode("utf-8"))
+            except urllib.error.HTTPError as e:
+                body = ""
+                try:
+                    body = e.read().decode("utf-8", "ignore")[:400]
+                except Exception:
+                    pass
+                hint, detail = explain_http_error(e.code, body)
+                took = time.monotonic() - t0
+                left = RETRY_BUDGET_S - (time.monotonic() - started)
+                if (e.code in RETRY_CODES and attempt < len(RETRY_BACKOFF)
+                        and took < RETRY_FAST_S and left > 1.0):
+                    wait = self._retry_wait(e, attempt)
+                    self._log("[AI] HTTP %s（%s），%.1fs 后重试（第 %d 次）"
+                              % (e.code, hint, wait, attempt + 1))
+                    time.sleep(wait)
+                    attempt += 1
+                    continue
+                raise AIError(hint, code=e.code, detail=body,
+                              retriable=e.code in RETRY_CODES) from e
+            except Exception as e:
+                # URLError（DNS/连接被拒/TLS）/ TimeoutError / socket 层错误
+                retriable = isinstance(
+                    e, (urllib.error.URLError, TimeoutError, OSError))
+                took = time.monotonic() - t0
+                left = RETRY_BUDGET_S - (time.monotonic() - started)
+                if (retriable and attempt < len(RETRY_BACKOFF)
+                        and took < RETRY_FAST_S and left > 1.0):
+                    wait = self._retry_wait(None, attempt)
+                    self._log("[AI] 网络错误（%s），%.1fs 后重试（第 %d 次）"
+                              % (type(e).__name__, wait, attempt + 1))
+                    time.sleep(wait)
+                    attempt += 1
+                    continue
+                raise AIError(
+                    ("网络不通（已重试 %d 次）" % attempt) if attempt else "网络不通",
+                    detail="%s: %s" % (type(e).__name__, e),
+                    retriable=retriable) from e
 
     def _get(self, path: str) -> dict:
         url = self.base_url + path

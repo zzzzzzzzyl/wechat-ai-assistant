@@ -1816,13 +1816,20 @@ class OcrReader:
               **内容已经进上下文了**，不必重复发；
             · 而**认不出字**的图（表情包 / 照片 / 纯图）会产出 `[图片]`，
               那才是**真正需要看图**的情况。
+        ⚠️ 2026-11-09 **加了两道上限**（原来只有长边 1024）：
+            · 张数：`ocr_read.max_images`（默认 3），只发**最近**的几张；
+              被丢掉的数目记在 `self._img_skipped`，由调用方那条日志带出去；
+            · 体积：统一 `capture.encode_for_model()`（JPEG + 300KB 预算）。
         ⚠️ 裁剪坐标和 `message.rect` 同原点（都是**裁剪区坐标**，
            见 `_build_messages`）—— `area` 就是那一块。
         """
+        limit = int(self.cfg.get("ocr_read.max_images", capture.IMG_MAX_COUNT) or 0)
+        cands = [m for m in messages if m.kind == "image" and m.rect]
+        self._img_skipped = max(0, len(cands) - limit) if limit > 0 else 0
+        if limit > 0:
+            cands = cands[-limit:]        # 只发**最近**的几张（后面的更新）
         out = []
-        for m in messages:
-            if m.kind != "image" or not m.rect:
-                continue
+        for m in cands:
             try:
                 x1, y1, x2, y2 = (int(v) for v in m.rect)
             except Exception:
@@ -1832,14 +1839,7 @@ class OcrReader:
             if x2 - x1 < 8 or y2 - y1 < 8:
                 continue
             sub = area.crop((x1, y1, x2, y2))
-            w, h = sub.size
-            k = min(1.0, float(_IMG_MAX_SIDE) / max(w, h))
-            if k < 1.0:
-                sub = sub.resize((max(1, int(w * k)), max(1, int(h * k))),
-                                 Image.LANCZOS)
-            buf = io.BytesIO()
-            sub.convert("RGB").save(buf, format="PNG")
-            out.append(base64.b64encode(buf.getvalue()).decode("ascii"))
+            out.append(capture.encode_for_model(sub))
         return out
 
     def _finish(self, snap, area, image_rects) -> None:
@@ -1896,13 +1896,22 @@ class OcrReader:
         #    （不裁剪、不压缩、不编码，零开销）。
         if self.cfg.get("ocr_read.attach_image"):
             snap.images = self._crop_images(area, snap.messages)
-            # ⚠️ 这行**每拍都会算**（读屏一直在跑），必须节流：数量变了才报。
+            # ⚠️ 这行**每拍都会算**（读屏一直在跑），必须节流：**内容变了才报**。
             #    不节流的话开着开关时终端每 0.5 秒刷一行，日志里别的信息全被冲掉。
+            # ⚠️ 2026-11-09：报的不只是张数，还带上**体积**和"被上限丢掉几张" ——
+            #    视觉模型按图算 token，只报张数看不出贵在哪。
+            _kb = capture.kb_of(snap.images)
+            _skip = getattr(self, "_img_skipped", 0)
             n_img = len(snap.images)
-            if n_img != self._img_logged:
-                self._img_logged = n_img
+            if (n_img, _kb, _skip) != self._img_logged:
+                self._img_logged = (n_img, _kb, _skip)
                 if n_img:
-                    self._log("附带 %d 张图片给模型看" % n_img)
+                    self._log("附带 %d 张图片给模型看（约 %d KB）%s"
+                              % (n_img, _kb,
+                                 ("，另有 %d 张没发（上限 %d）"
+                                  % (_skip, int(self.cfg.get("ocr_read.max_images",
+                                                             capture.IMG_MAX_COUNT) or 0)))
+                                 if _skip else ""))
                 else:
                     self._log("本屏没有可发的图片（开关是开的）")
 

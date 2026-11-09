@@ -235,6 +235,80 @@ def is_blank(img, threshold: int = 8) -> bool:
         return True
 
 
+#: 发给**视觉模型**的图片：长边上限 / JPEG 质量 / 单张字节软上限。
+#:
+#: ⚠️ 2026-11-09 用户问「有没有图片大小上限」—— 原来**只有长边 1024**，
+#:    没有张数、没有体积上限，而且存成 **PNG**（照片类内容能到 1~2 MB，
+#:    base64 再 ×1.33）。视觉模型按图算 token，一张大图就是几千输入 token：
+#:    实测纯文本平均输入 **821 token**，一屏 4 张图能顶到 4000+。
+IMG_MAX_SIDE = 1024
+IMG_JPEG_QUALITY = 85
+IMG_MAX_BYTES = 300 * 1024
+IMG_MIN_SIDE = 320
+
+#: 默认最多发几张（配置项 `ocr_read.max_images`）。
+IMG_MAX_COUNT = 3
+
+
+def fit_image(img, max_side: int = IMG_MAX_SIDE, quality: int = IMG_JPEG_QUALITY,
+              max_bytes: int = IMG_MAX_BYTES):
+    """把图缩到长边 `max_side` 并按体积预算压成 JPEG，返回 (PIL.Image, bytes)。
+
+    降体积的顺序：**先降质量（85→70），再缩长边（每次 ×0.8，最低 320）**。
+    ⚠️ 缩长边放在降质量之后：降质量几乎不改变模型"看得懂"的程度，
+        缩分辨率会丢字；所以先动质量。
+    """
+    import io
+
+    from PIL import Image
+
+    sub = img.convert("RGB")
+    w, h = sub.size
+    k = min(1.0, float(max_side) / max(w, h))
+    if k < 1.0:
+        sub = sub.resize((max(1, int(w * k)), max(1, int(h * k))), Image.LANCZOS)
+
+    def _encode(im, q):
+        buf = io.BytesIO()
+        im.save(buf, format="JPEG", quality=int(q), optimize=True)
+        return buf.getvalue()
+
+    data = _encode(sub, quality)
+    if max_bytes and len(data) > max_bytes:
+        data = _encode(sub, max(60, quality - 15))
+    while max_bytes and len(data) > max_bytes and max(sub.size) > IMG_MIN_SIDE:
+        nw = max(IMG_MIN_SIDE, int(sub.width * 0.8))
+        nh = max(IMG_MIN_SIDE, int(sub.height * 0.8))
+        if (nw, nh) == sub.size:
+            break
+        sub = sub.resize((nw, nh), Image.LANCZOS)
+        data = _encode(sub, max(60, quality - 15))
+    return sub, data
+
+
+def encode_for_model(img, max_side: int = IMG_MAX_SIDE,
+                     quality: int = IMG_JPEG_QUALITY,
+                     max_bytes: int = IMG_MAX_BYTES) -> str:
+    """把一张 PIL 图压成**能直接喂视觉模型**的 base64（JPEG，带体积上限）。
+
+    ⚠️ 原来两处调用各自 `save(format="PNG")` —— 这就是"图片没有上限"的来源：
+        PNG + 照片 = 巨大；现在统一走这里（JPEG + 体积预算），**两处共用一份实现**。
+    """
+    import base64
+
+    _img, data = fit_image(img, max_side=max_side, quality=quality,
+                           max_bytes=max_bytes)
+    return base64.b64encode(data).decode("ascii")
+
+
+def kb_of(b64_list) -> int:
+    """一串 base64 大约多少 KB（给日志用，不解码整串）。"""
+    try:
+        return int(sum(len(s) for s in b64_list) * 3 / 4 / 1024)
+    except Exception:
+        return 0
+
+
 def crop_window_region(img, wrect, rect):
     """从窗口位图里裁出屏幕坐标 rect 对应的区域；越界自动收敛，无效返回 None。"""
     if img is None:

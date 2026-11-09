@@ -328,6 +328,104 @@ def test_reply_target_wording():
     check("current 为空时不拼那段标题", "【当前屏幕上的对话】" not in user3)
 
 
+def test_retry_and_errors():
+    """重试与错误码分类（2026-11-09 加）。
+
+    守三件事：
+      1. **429 会重试**（限流是瞬态），重试成功就当没发生；
+      2. **401 不重试**（鉴权错重试一遍还是错），而且给的是人话；
+      3. **500 重试到 3 次**才放弃，界面拿到的仍是人话（原始 body 只进日志）。
+    """
+    import urllib.error
+
+    import wechat_assistant.ai as ai_mod
+
+    class Cfg:
+        def __init__(self, **kw):
+            self._d = kw
+
+        def get(self, key, default=None):
+            return self._d.get(key, default)
+
+    logs = []
+    client = AIClient(Cfg(**{"ai.api_key": "sk-x",
+                             "ai.base_url": "https://example.com",
+                             "ai.model": "m", "ai.timeout": 5}),
+                      logger=logs.append)
+
+    class Ok:
+        def read(self):
+            return b'{"choices":[{"message":{"content":"ok"}}],"usage":{}}'
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    old_open = ai_mod.urllib.request.urlopen
+    old_backoff = ai_mod.RETRY_BACKOFF
+    ai_mod.RETRY_BACKOFF = (0.0, 0.0)          # 测试里别真睡
+    try:
+        print("\n1e. 失败重试与错误码分类（不联网，打桩 urlopen）")
+        calls = {"n": 0}
+
+        def flaky(req, timeout=None):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise urllib.error.HTTPError(req.full_url, 429, "Too Many", {}, None)
+            return Ok()
+
+        ai_mod.urllib.request.urlopen = flaky
+        out = client.chat("s", "u")
+        check("429 自动重试一次后成功", out == "ok" and calls["n"] == 2,
+              "%r / 调用 %d 次" % (out, calls["n"]))
+        check("重试会记一行日志（含状态码）",
+              any("重试" in m and "429" in m for m in logs), repr(logs[-2:]))
+
+        calls["n"] = 0
+
+        def always_401(req, timeout=None):
+            calls["n"] += 1
+            raise urllib.error.HTTPError(req.full_url, 401, "Unauthorized", {}, None)
+
+        ai_mod.urllib.request.urlopen = always_401
+        try:
+            client.chat("s", "u")
+            err, code = "", None
+        except AIError as e:
+            err, code = str(e), e.code
+        check("401 **不重试**（鉴权错重试没意义）", calls["n"] == 1, "调用 %d 次" % calls["n"])
+        check("401 报的是人话（不是裸 HTTP）",
+              "Key" in err and "401" not in err, err)
+        check("AIError 带上了状态码（供上层分类）", code == 401, repr(code))
+
+        calls["n"] = 0
+
+        def always_500(req, timeout=None):
+            calls["n"] += 1
+            raise urllib.error.HTTPError(req.full_url, 500, "Boom", {}, None)
+
+        ai_mod.urllib.request.urlopen = always_500
+        try:
+            client.chat("s", "u")
+            err = ""
+        except AIError as e:
+            err = str(e)
+        check("500 重试到 3 次才放弃（1 + 2 次重试）", calls["n"] == 3,
+              "调用 %d 次" % calls["n"])
+        check("500 报的仍是人话", "服务端" in err, err)
+
+        check("错误码表覆盖了常见的几个",
+              all(ai_mod.explain_http_error(c)[0] for c in (400, 401, 403, 404, 413, 429,
+                                                            500, 502, 503, 504)))
+        check("不认识的状态码也能说一句（不抛）",
+              ai_mod.explain_http_error(999)[0].startswith("接口返回"), "")
+    finally:
+        ai_mod.urllib.request.urlopen = old_open
+        ai_mod.RETRY_BACKOFF = old_backoff
+
+
 def main():
     offline = "--offline" in sys.argv
     print("=" * 80)
@@ -337,6 +435,7 @@ def main():
     test_parse()
     test_prompt_template()
     test_missing_config()
+    test_retry_and_errors()
     test_build_prompts_appends_format()
     test_reply_target_wording()
 

@@ -296,6 +296,11 @@ SPEC: List[Setting] = [
     Setting("ocr_read.attach_image", "ai", "识别图片", "bool",
             default=False,
             help="把聊天里的图片发给模型识别（需要模型支持看图）。开启后可能会消耗更多费用"),
+    # ⚠️ 2026-11-09：图片原来**只有长边上限**（1024），没有张数/体积上限 ——
+    #    视觉模型按图算 token，一屏 4 张能把输入从 821 顶到 4000+。
+    Setting("ocr_read.max_images", "ai", "最多几张图", "int", default=3, lo=1, hi=10,
+            unit="张", level=2,
+            help="一次最多发几张，多了只发最近的。图越多花得越多。"),
     Setting("ai.vision_model", "ai", "视觉模型", "text", default="",
             help="留空 = 用上面那个模型。填了就只在识别图片时用它"),
     Setting("ai.system_prompt", "ai", "系统提示词（整段可改）", "multiline",
@@ -337,7 +342,7 @@ SPEC: List[Setting] = [
             help="写「你是谁、跟谁说话」。反 AI 腔的规则在「AI 接口 → 系统提示词」；"
                  "想给某个会话单独写，去「会话」分组。"),
     Setting("persona.default_relationship", "persona", "默认关系", "text", default="朋友",
-            help="影响称呼和语气。写名词或一句话都行（女朋友 / 我是他的爹）。"),
+            help="影响称呼和语气。写名词或一句话都行。"),
     Setting("style.enabled", "persona", "口吻样本", "bool", default=True,
             help="把「我」最近发过的短消息喂给模型照着模仿。"),
     Setting("style.max_samples", "advanced", "样本条数", "int", default=12, lo=0, hi=50,
@@ -581,15 +586,14 @@ def test_api(base_url: str, api_key: str, model: str, timeout: float = 20.0):
             detail = (payload.get("error") or {}).get("message") or ""
         except Exception:
             pass
-        if e.code == 401:
-            return False, "API Key 无效（401）" + ("：" + detail if detail else "")
-        if e.code == 404:
-            return False, "地址或模型名不对（404）" + ("：" + detail if detail else "")
-        if e.code == 402:
-            return False, "余额不足（402）"
-        return False, "HTTP %s %s" % (e.code, detail)
+        # ⚠️ 2026-11-09：分类**和生成路径共用**（`ai.explain_http_error`）——
+        #    原来这里有一份手写的 401/404/402，而生成路径甩的是 `HTTP 500: {...}`。
+        from .ai import explain_http_error
+
+        hint, _ = explain_http_error(e.code, detail)
+        return False, "%s（%s）%s" % (hint, e.code, ("：" + detail) if detail else "")
     except Exception as e:
-        return False, "%s: %s" % (type(e).__name__, e)
+        return False, "连不上（%s）" % type(e).__name__
 
 
 # ---------------------------------------------------------------- 存储

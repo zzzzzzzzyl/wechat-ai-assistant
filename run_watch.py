@@ -1425,18 +1425,30 @@ def main():
                 show_replies(sess, replies, intent=intent)
                 log("生成 %d 条建议" % len(replies))
             except Exception as e:
-                show_replies(sess, [], "%s: %s" % (type(e).__name__, e))
+                # ⚠️ 2026-11-09：`AIError` 的 `str(e)` 现在就是**给用户看的一句话**
+                #    （「API Key 无效或已过期」这类，见 `ai.HTTP_HINTS`），
+                #    原始响应在 `e.detail` 里 —— 只进日志，不上界面。
+                _detail = getattr(e, "detail", "")
+                if _detail:
+                    log("失败详情: %s" % str(_detail)[:400])
+                show_replies(sess, [], str(e) or type(e).__name__)
         except Exception as e:
             # ⚠️ 2026-11-08：这里以前**只往状态行写**，日志里一个字都没有 ——
             #    用户报「遇到没出现过的错误」时，我只能用 UIA 去把界面上那行读出来。
             #    任何失败都必须**同时落日志**，否则等于没记录。
             msg = "%s: %s" % (type(e).__name__, e)
             log("处理失败: " + msg)
+            _detail = getattr(e, "detail", "")
+            if _detail:
+                log("失败详情: %s" % str(_detail)[:400])
             if "COMError" in msg:
                 # UIA 的 COM 瞬态：给用户一句能懂的，原始错误看日志。
                 # ⚠️ 状态行**一行 ≤20 字**（`tools/audit_ui_text.py` 会查）——
                 #    原来那句「读不到微信内容（可能在重绘），稍等再点一次」是 21 字。
                 emit("读不到微信内容，稍等再点一次")
+            elif getattr(e, "code", None):
+                # AI 的 HTTP 错误：`str(e)` 已经是中文短句了，别再套 "处理失败: "
+                emit(str(e))
             else:
                 emit("处理失败: %s" % (msg[:26]))
         finally:
