@@ -2395,6 +2395,53 @@ def test_updater_row(app, tmp):
         safe(win.close)
 
 
+def test_update_signal(app, tmp):
+    """检查更新的**跨线程回传**（2026-11-09 用户实测报的 bug）。
+
+    ⚠️⚠️ 原来用 `QMetaObject.invokeMethod(..., Q_ARG(object, res))` 回传 dict，
+        PySide6 直接报：
+            `RuntimeError: qArgDataFromPyType: Unable to find a QMetaType for "object"`
+        结果就是**点了「检查更新」永远没有反应**（日志里只有一行"回传更新结果失败"）。
+        现在改成 `Signal(object)` —— 这条测试钉住"结果能回到 UI 线程"。
+    """
+    print("\n14g. 检查更新的结果能回传到界面（不联网）")
+    from wechat_assistant import updater
+    from wechat_assistant.qt_ui import settings_ui as qs
+
+    win, _store, _style = make_win(tmp, level="novice")
+    shown = []
+    real_latest, real_err = updater.latest, qs._error
+    try:
+        win.open("base")
+        pump(app, 200)
+
+        # ① 有新版：结果要回到 `_on_update_checked`（源码版 -> 弹"请 git pull"）
+        updater.latest = lambda **kw: {"version": "9.9.9", "url": "u", "size": 1024,
+                                       "published": ""}
+        qs._error = lambda *a, **kw: shown.append(a)
+        win._check_update_worker()          # 子线程里做的事，这里同步跑
+        pump(app, 200)
+        check("有新版时结果回到了界面（弹了提示框）", bool(shown), repr(shown[:1]))
+        check("  提示里说了新版号", any("9.9.9" in str(x) for x in shown),
+              repr(shown[:1]))
+
+        # ② 查不到：也要回到界面且说清"连不上"
+        shown.clear()
+
+        def boom(**kw):
+            raise RuntimeError("所有更新源都查不到：x")
+
+        updater.latest = boom
+        win._check_update_worker()
+        pump(app, 200)
+        check("查不到时也会回到界面（不是静默没反应）", bool(shown), repr(shown[:1]))
+        check("  提示里说了「连不上」",
+              any("连不上" in str(x) for x in shown), repr(shown[:1]))
+    finally:
+        updater.latest, qs._error = real_latest, real_err
+        safe(win.close)
+
+
 def test_autostart_switch(app, tmp):
     """「外观」组里的**开机自启**开关（2026-11-09 用户要求）。
 
@@ -2518,6 +2565,7 @@ def main():
         test_drag_offscreen(app, tmp)
         test_autostart_switch(app, tmp)
         test_updater_row(app, tmp)
+        test_update_signal(app, tmp)
         test_no_tk_leftovers()
 
         print("\n15. 没有污染仓库")

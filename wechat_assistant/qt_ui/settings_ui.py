@@ -891,6 +891,17 @@ class SettingsWindow(QtCore.QObject):
     # 「测试连接」的结果（子线程 emit -> UI 线程收）
     _test_done = QtCore.Signal(bool, str)
 
+    #: 检查更新的两个回传（子线程 emit -> UI 线程收）。
+    #:
+    #: ⚠️⚠️ 2026-11-09 实测踩到的坑：一开始用
+    #:    `QMetaObject.invokeMethod(self, "_on_update_checked", QueuedConnection,
+    #:     Q_ARG(object, res))` —— PySide6 **不认 `object` 这个元类型**，运行时报
+    #:    `qArgDataFromPyType: Unable to find a QMetaType for "object"`，
+    #:    于是"检查更新"永远没有结果（日志里只有一行"回传更新结果失败"）。
+    #:    → 跨线程回传**传 Python 对象**（dict）只有一条干净路：`Signal(object)`。
+    _update_checked = QtCore.Signal(object)
+    _update_ready = QtCore.Signal(object)
+
     def __init__(self, cfg, store: SettingsStore, style: Style,
                  logger: Optional[Callable[[str], None]] = None,
                  on_saved: Optional[Callable[[], None]] = None,
@@ -956,6 +967,10 @@ class SettingsWindow(QtCore.QObject):
         self._nav_btns: Dict[str, object] = {}
 
         self._test_done.connect(self._on_test_done)
+        # ⚠️ 这两个连接必须只做一次（在 __init__ 里），别放进 `_build()` ——
+        #    每次重建界面都连一遍，会变成"结果处理好几遍"。
+        self._update_checked.connect(self._on_update_checked)
+        self._update_ready.connect(self._on_update_ready)
 
     # ------------------------------------------------------------ 生命周期
 
@@ -1637,11 +1652,10 @@ class SettingsWindow(QtCore.QObject):
             res = {"ok": True, "info": info}
         except Exception as e:
             res = {"ok": False, "err": "%s: %s" % (type(e).__name__, e)}
-        # ⚠️ 子线程**绝不能碰控件**：走队列回到 UI 线程（项目铁律）。
+        # ⚠️ 子线程**绝不能碰控件**：用 Signal 回 UI 线程（Qt 会自动排队）。
+        #    这里**不能**用 `invokeMethod + Q_ARG(object, dict)` —— PySide6 不认那个元类型。
         try:
-            QtCore.QMetaObject.invokeMethod(
-                self, "_on_update_checked", QtCore.Qt.QueuedConnection,
-                QtCore.Q_ARG(object, res))
+            self._update_checked.emit(res)
         except Exception as e:
             self._log("回传更新结果失败: %s: %s" % (type(e).__name__, e))
 
@@ -1714,12 +1728,11 @@ class SettingsWindow(QtCore.QObject):
             res = {"ok": True, "app_dir": app_dir, "version": got}
         except Exception as e:
             res = {"ok": False, "err": "%s: %s" % (type(e).__name__, e)}
+        # 同 `_check_update_worker`：用 Signal 回 UI 线程，不用 `Q_ARG(object, …)`。
         try:
-            QtCore.QMetaObject.invokeMethod(
-                self, "_on_update_ready", QtCore.Qt.QueuedConnection,
-                QtCore.Q_ARG(object, res))
-        except Exception:
-            pass
+            self._update_ready.emit(res)
+        except Exception as e:
+            self._log("回传更新结果失败: %s: %s" % (type(e).__name__, e))
 
     @QtCore.Slot(object)
     def _on_update_ready(self, res):
