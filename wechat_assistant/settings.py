@@ -182,8 +182,7 @@ class Setting:
         return str(value)
 
 
-GROUPS = [
-    # ⚠️ 2026-11-08：**「基础设置」放最前面**（用户要求「多一个基础设置」）——
+GROUPS = [    # ⚠️ 2026-11-08：**「基础设置」放最前面**（用户要求「多一个基础设置」）——
     #    里面只有「配置级别」一项，决定后面各组分不分组显示；
     #    它是进设置后的第一屏，也是新手指引的落脚点。
     ("base",     "基础设置",   "为不同人群展示不同配置项，减少上手难度。"),
@@ -194,11 +193,11 @@ GROUPS = [
     #    ⚠️ `ai.base_url` **留在这里**：换服务商时只改「模型」不改接口地址
     #       会得到很难查的报错，它和「模型」是同一层的东西。
     ("ai",       "AI 接口",    "接口、模型、提示词、生成条数。"),
+    ("ui",       "外观",       "配色、窗口怎么跟微信配合。宽度直接拖面板左右边缘。"),
+    ("record",   "会话与记录", "记录哪些会话、怎么读、要不要把图片也发给模型。"),
+    ("behavior", "行为",       "热键，以及给模型带多少条聊天记录。"),
     ("persona",  "人设与口吻", "你是谁、跟谁说话、照着谁的口吻写。"),
     ("session",  "会话",       "每个会话单独设模式、人设和关系。关掉的会话完全不读不记。"),
-    ("ui",       "外观",       "配色、窗口怎么跟微信配合。宽度直接拖面板左右边缘。"),
-    ("behavior", "行为",       "热键，以及给模型带多少条聊天记录。"),
-    ("record",   "会话与记录", "记录哪些会话、怎么读、要不要把图片也发给模型。"),
     # ⚠️ 2026-10-17：知识库**单独一组**（用户要求「设置里面另开一项」）。
     #    它只有「启用」一行是 SPEC 项，下面那块"文件清单"是**手写控件**
     #    （`settings_ui._build_kb_files`）—— 列表 + 按钮塞不进 SPEC 的一行一项模型，
@@ -283,27 +282,33 @@ SPEC: List[Setting] = [
     Setting("ai.base_url", "ai", "接口地址", "text", default="",
             # ⚠️ help 里**不要再复述 label**（"服务商的接口地址"）——
             #    `tools/audit_ui_text.py` 第②段就是查这个，2026-10-14 报过 1 处。
-            help="例如 https://api.deepseek.com。"
-                 "照服务商文档填，留空没法调用。", level=1),
+            help="例如 https://api.deepseek.com。", level=1),
     Setting("ai.model", "ai", "模型", "text", default="",
-            help="服务商给的模型名，例如 deepseek-flash。"
-                 "填错会在生成时报错，留空没法调用。", level=1),
+            help="例如 deepseek-flash。", level=1),
     # ⚠️ 2026-10-14：这一项**从「会话与记录」挪到「AI 接口」**（用户要求
     #    「把分析图片放在 AI 栏里面」）—— 它决定的是"发给模型的请求里带不带图"，
     #    是 AI 侧的开关，跟记录本身没关系。
     # ⚠️ 同一天**又往前挪了一格**（用户要求「改到视觉模型前面，名称叫识别图片」）：
     #    SPEC 里的**先后**就是界面上的先后（`settings_ui` 按 SPEC 顺序铺）。
+    Setting("ai.n_replies", "ai", "生成几条", "int", default=3, lo=1, hi=8, unit="条",
+            level=1),
+    # ⚠️ 2026-11-09：**联网查证**（默认关）。开着时给模型挂服务商的搜索工具，
+    #    **由模型自己判断要不要查**。只在 DeepSeek 接口上用官方工具；
+    #    别的接口报 400 会自动退回不联网（见 `ai.chat`），不会把生成搞挂。
+    Setting("ai.web_search", "ai", "联网查证", "bool", default=False,
+            level=2,
+            help="需要最新消息时让它上网查。会多花几分钱。"),
     Setting("ocr_read.attach_image", "ai", "识别图片", "bool",
             default=False,
-            help="把聊天里的图片发给模型识别（需要模型支持看图）。开启后可能会消耗更多费用"),
+            help="让模型看图，需要支持看图的模型。"),
     # ⚠️ 2026-11-09：图片原来**只有长边上限**（1024），没有张数/体积上限 ——
     #    视觉模型按图算 token，一屏 4 张能把输入从 821 顶到 4000+。
     Setting("ocr_read.max_images", "ai", "最多几张图", "int", default=3, lo=1, hi=10,
             unit="张", level=2,
-            help="一次最多发几张，多了只发最近的。图越多花得越多。"),
+            help="多了只发最近的几张。"),
     Setting("ai.vision_model", "ai", "视觉模型", "text", default="",
-            help="留空 = 用上面那个模型。填了就只在识别图片时用它"),
-    Setting("ai.system_prompt", "ai", "系统提示词（整段可改）", "multiline",
+            help="留空 = 用上面的模型。"),
+    Setting("ai.system_prompt", "ai", "系统提示词", "multiline",
             default=prompts.DEFAULT_SYSTEM_TEMPLATE,
             # ⚠️ 开局就要看得见十几行（这段有一整个屏幕长）。
             #    它只是**初始高度** —— 框底下有一条把手，用户可以自己上下拖。
@@ -320,50 +325,9 @@ SPEC: List[Setting] = [
                  # ⚠️ 2026-10-14：「看提示词」从悬浮窗搬到了**这个窗口里**
                  #    （就挂在这一项下面），所以文案要指向"下面那颗"。
                  ),
-    Setting("ai.n_replies", "ai", "生成几条", "int", default=3, lo=1, hi=8, unit="条",
-            level=1),
-    # ⚠️ 2026-11-09：**联网查证**（默认关）。开着时给模型挂服务商的搜索工具，
-    #    **由模型自己判断要不要查**。只在 DeepSeek 接口上用官方工具；
-    #    别的接口报 400 会自动退回不联网（见 `ai.chat`），不会把生成搞挂。
-    Setting("ai.web_search", "ai", "联网查证", "bool", default=False,
-            level=2,
-            help="需要最新消息时让它自己上网查。会多花一点钱，也会慢一点。"),
-    Setting("ai.max_tokens", "advanced", "最长输出", "int", default=2000, lo=64, hi=8192,
-            unit="token",
-            help="一次最多输出多少。模型的「思考」也算在里面 —— 调小了可能光想不答，"
-                 "正文一个字都出不来。"),
-    Setting("ai.timeout", "advanced", "超时", "int", default=60, lo=5, hi=300, unit="秒",
-            help="等模型回话的最长时间。网络慢或模型排队时才需要调大。"),
-    # ⚠️ 2026-11-09 用户问「是否有用 github 加速」：**下载更新**慢时可以填一个加速前缀。
-    #    留空 = 自动（直连 8 秒不够快就依次换内置镜像，见 `updater.MIRROR_PREFIXES`）。
-    Setting("update.mirror", "advanced", "更新加速地址", "text", default="",
-            help="下载更新慢时填一个加速前缀，例如 https://ghfast.top/ 。留空 = 自动换源。"),
-    # ⚠️ 2026-10-13：「随机性」从常用组挪进「高级」。
-    #    代码**真的在用**它（`ai.py:93` 读、`ai.py:192` 随请求发出去），不是死变量；
-    #    但默认 1.0 = 模型自己的默认值，等于「没设」——
-    #    而改了它**看不出效果**（只影响措辞的飘不飘），属于"调完就不动"的那一类。
-    #    判据同 `test_settings.py` 第 8 节：数值调参一律放「高级」。
-    Setting("ai.temperature", "advanced", "随机性", "float", default=1.0, lo=0.0, hi=2.0,
-            help="调低更稳、调高更活。0 附近容易每次都写出一样的句子。"),
-
-    # ---- 人设与口吻 ----
-    Setting("persona.default", "persona", "全局人设", "multiline",
-            default="你帮「我」写微信回复。写的是「我」要说的话，用第一人称，直接能发出去。",
-            help="写「你是谁、跟谁说话」。反 AI 腔的规则在「AI 接口 → 系统提示词」；"
-                 "想给某个会话单独写，去「会话」分组。"),
-    Setting("persona.default_relationship", "persona", "默认关系", "text", default="朋友",
-            help="影响称呼和语气。写名词或一句话都行。"),
-    Setting("style.enabled", "persona", "口吻样本", "bool", default=True,
-            help="把「我」最近发过的短消息喂给模型照着模仿。"),
-    Setting("style.max_samples", "advanced", "样本条数", "int", default=12, lo=0, hi=50,
-            unit="条"),
-    Setting("style.max_length", "advanced", "样本长度上限", "int", default=60, lo=10, hi=500,
-            unit="字", help="超过这个字数的消息不算口吻样本（长段落不代表日常说话）。"),
-
-    # ---- 外观 ----
     Setting("ui.theme", "ui", "主题", "choice", default="system",
             choices=[("system", "跟随系统"), ("dark", "深色"), ("light", "浅色")],
-            help="跟随系统 = 跟电脑的深色/浅色设置；也可以钉死成深色或浅色。",
+            help="跟随系统 = 跟着电脑的深浅色。",
             level=1),
     # ⚠️ 2026-10-14 **删掉「无边框窗口」**（`ui.frameless`，用户要求「删除无边框窗口吧」）：
     #    · 关掉它只是退回**系统标题栏**（多一条丑边），而这个程序的面板是**贴边跟随**的、
@@ -384,12 +348,11 @@ SPEC: List[Setting] = [
     #    ⚠️ 键和读取代码都留着（`config.yaml` / `panel.py`）——"删的是设置项，不是功能"。
     Setting("ui.attach", "ui", "跟随微信", "choice", default="dock",
             choices=[("dock", "贴边跟随"), ("float", "固定悬浮"), ("off", "不跟随")],
-            help="贴边 = 自动站到微信旁边，位置和高度都跟着微信。"
-                 "固定悬浮 = 记住你拖的位置，跟着微信平移，不会被拉回边上。",
+            help="贴边 = 站在微信旁边；固定悬浮 = 记住你拖的位置。",
             level=1),
     Setting("ui.dock_side", "ui", "贴哪边", "choice", default="auto",
             choices=[("auto", "自动（右→左→角落）"), ("right", "固定右侧"), ("left", "固定左侧")]),
-    Setting("ui.follow_minimize", "ui", "微信最小化时一起收起", "bool", default=True),
+    Setting("ui.follow_minimize", "ui", "最小化时一起收起", "bool", default=True),
     # ⚠️⚠️ 2026-10-13 **删掉「面板宽度」这一项**（用户提的）。
     #    它本来就在面板上直接调：拖**左/右边缘**改宽度，松手就
     #    `_save_width()` 写回同一个 `ui.width` 键，状态栏还会说"已记住"
@@ -398,24 +361,11 @@ SPEC: List[Setting] = [
     #    ⚠️ **配置键 `ui.width` 保留**（面板和跟随器都要读它），
     #       `SettingsStore.set()` 不校验 SPEC，所以拖动保存这条路不受影响。
     #    范围由下面两项限定：`ui.min_width` / `ui.width_max`。
-    Setting("ui.min_width", "advanced", "缩窄下限", "int", default=200, lo=120, hi=400,
-            unit="px",
-            help="空间不够时面板会自动缩窄到这个宽度；连它都放不下就不再跟随。"
-                 "也是拖宽度时的下限。"),
-    Setting("ui.width_max", "advanced", "宽度上限", "int", default=640, lo=240, hi=1200,
-            unit="px",
-            help="拖面板左右边缘调宽度时的上限。"),
-    Setting("ui.follow_interval", "advanced", "跟随检查间隔", "float", default=0.016,
-            lo=0.008, hi=2.0, unit="秒",
-            help="多久看一眼微信的位置。调大省电，但拖微信时面板会一跳一跳地跟。"),
     Setting("ui.height", "ui", "面板高度", "int", default=0, lo=0, hi=2000, unit="px",
-            help="0 = 跟随微信窗口的高度（推荐）。填正数则钉死这个高度。"
-                 "微信没开时才退回「按回复内容自适应」。"),
+            help="0 = 跟着微信的高度。"),
     Setting("ui.opacity", "ui", "不透明度", "float", default=1.0, lo=0.5, hi=1.0),
     Setting("ui.topmost", "ui", "总是置顶", "bool", default=False,
-            help="只在上面选了「不跟随」时才起作用：那种情况下没人把面板抬到微信上面，"
-                 "一被别的窗口盖住就找不回来。跟随中会自动不生效（切到别的程序时"
-                 "不该还压在最上面）。"),
+            help="只在「固定悬浮」下有用。"),
 
     # ---- 行为 ----
     # ⚠️ 2026-10-13 这一组从 9 项砍到 2 项（用户要求「方便用户操作」）。
@@ -429,30 +379,15 @@ SPEC: List[Setting] = [
     #    开着会在你切窗口/切会话时**自己调 AI 花钱**，所以一直是默认关；
     #    ⚠️ **代码路径全部留着**（`trigger.py` / `run_watch.py` 照旧 `.get(..., False)`），
     #    值恒为假 = 行为和以前一模一样；想恢复就把两行 `Setting(...)` 加回来。
-    Setting("trigger.on_hotkey", "behavior", "全局热键", "text", default="Ctrl+Alt+Q",
-            restart=True, help="程序不在前台也能响应。改完需要重启程序。"),
-    Setting("runtime.max_messages", "behavior", "喂给 AI 的消息条数", "int", default=20,
-            lo=2, hi=200, unit="条",
-            help="带多少条聊天记录给模型看。给得越多越贵，一般 20 条够用。"),
-    # ⚠️ 2026-10-14：这一项**原来在「高级」**（按"默认关、别开就别摆出来"的判据），
-    #    用户要求「把鼠标定位放在行为里面」→ 挪进常用组。
-    #    ⚠️ 它的 help 原来写着"建议一直关着"，挪过来之后那句话和位置自相矛盾，
-    #    改成把**两种行为**讲清楚；默认仍然是关。
-    Setting("reply.use_cursor_anchor", "behavior", "用鼠标位置定位回复目标", "bool",
-            default=False,
-            help="只把鼠标停着的那一条当回复目标（要先把鼠标放上去再按热键）。"),
-
-    # ---- 会话与记录 ----
     Setting("record.enabled", "record", "静默记录", "bool", default=True, restart=True,
             level=1,
-            help="每隔几秒读一次当前会话存起来，给模型当上下文。不调 AI、不花钱、不提醒。"),
+            help="每隔几秒存一次，不花钱。"),
     # ⚠️ 全项目只有这一处的默认值是 **choice 而不是 bool**，因为它是三态：
     #    要不要用「截屏 + OCR」这条备用路。
     Setting("reader.backend", "record", "读取方式", "choice", default="auto", restart=True,
             level=1,
             choices=[("auto", "自动"), ("uia", "只用微信控件"), ("ocr", "只用截图认字")],
-            help="自动：先读微信自己的控件，读不到就改用截图认字。"
-                 "截图认字只能看到当前一屏，也认不出图片。"),
+            help="自动读不到控件时改用截图认字。"),
     # ⚠️ 2026-10-14 **删掉「按需读屏」和「一直读屏」**（用户要求「按照默认的来就可」）：
     #    · `ocr_read.probe`（默认 **true**）—— 每秒轻量探一次、真变了才仔细读，
     #      这是**推荐**的那一档，本来也不该有人关它（关了 = 你翻过的屏一条都不留）；
@@ -465,16 +400,112 @@ SPEC: List[Setting] = [
     Setting("sessions.default_mode", "record", "新会话默认模式", "choice", default="on",
             restart=True,
             choices=[("on", "开（记录 + 可生成）"), ("observe", "只记录不生成"), ("off", "关")],
-            help="默认「开」：你打开的每个会话都会被记录。"
-                 "不想被记的写进黑名单（在下面）；单个会话的开关在「会话」分组。"),
-    Setting("sessions.disabled", "record", "黑名单（一行一个）", "list", restart=True,
-            help="写进来的会话不读、不记录、不生成。敏感会话放这里。"
-                 "⚠️ 启动时生效，优先于「会话」分组里选的模式。"),
+            help="新会话默认开还是关。"),
+    Setting("sessions.disabled", "record", "黑名单", "list", restart=True,
+            help="这里写的会话不读也不记。"),
 
     # ---- 高级 ----
     # ⚠️ 2026-10-13：常用组里那些"调完就不动"的项都堆到这一组（用户要求"方便操作"）。
     #    这一组**不设条数上限** —— 它就是专门放杂项的地方。
-    Setting("state.path", "advanced", "运行数据文件", "text", default="state/state.json",
+    Setting("trigger.on_hotkey", "behavior", "全局热键", "text", default="Ctrl+Alt+Q",
+            restart=True, help="程序不在前台也能按。改完要重启。"),
+    Setting("runtime.max_messages", "behavior", "上下文条数", "int", default=20,
+            lo=2, hi=200, unit="条",
+            help="带多少条历史。越多越贵。"),
+    # ⚠️ 2026-10-14：这一项**原来在「高级」**（按"默认关、别开就别摆出来"的判据），
+    #    用户要求「把鼠标定位放在行为里面」→ 挪进常用组。
+    #    ⚠️ 它的 help 原来写着"建议一直关着"，挪过来之后那句话和位置自相矛盾，
+    #    改成把**两种行为**讲清楚；默认仍然是关。
+    Setting("reply.use_cursor_anchor", "behavior", "用鼠标定位回复目标", "bool",
+            default=False,
+            help="把鼠标停着的那条当回复目标。"),
+
+    # ---- 会话与记录 ----
+    Setting("persona.default", "persona", "全局人设", "multiline",
+            default="你帮「我」写微信回复。写的是「我」要说的话，用第一人称，直接能发出去。",
+            help="你是谁、跟谁说话。"),
+    Setting("persona.default_relationship", "persona", "默认关系", "text", default="朋友",
+            help="影响称呼和语气。"),
+    Setting("style.enabled", "persona", "口吻样本", "bool", default=True,
+            help="让模型模仿你平时怎么说话。"),
+    Setting("kb.enabled", "kb", "启用知识库", "bool", default=False,
+            help="导入资料，回复时参考。"),
+
+    # 下面两项"调完就不动"，进「高级」（判据见 `test_settings.py` 第 12 节）。
+    # ⚠️ `kb.min_ratio` / `kb.chunk_chars` **故意不进设置界面**：
+    #    一个是 0~1 的分数门槛、一个是切片长度，给用户看不加价值只会挑错。
+    #    它们由 `kb.py` 的默认值承担（代码里读，不是死变量）。
+    Setting("ai.max_tokens", "advanced", "最长输出", "int", default=2000, lo=64, hi=8192,
+            unit="token",
+            help="思考也算在里面，调小可能只思考不出字。"),
+    Setting("ai.temperature", "advanced", "随机性", "float", default=1.0, lo=0.0, hi=2.0,
+            help="低更稳，高更活。"),
+
+    # ---- 人设与口吻 ----
+    Setting("ai.timeout", "advanced", "超时", "int", default=60, lo=5, hi=300, unit="秒",
+            help="等模型回话的最长时间。"),
+    # ⚠️ 2026-11-09 用户问「是否有用 github 加速」：**下载更新**慢时可以填一个加速前缀。
+    #    留空 = 自动（直连 8 秒不够快就依次换内置镜像，见 `updater.MIRROR_PREFIXES`）。
+    Setting("runtime.max_chars", "advanced", "上下文总长上限", "int", default=4000,
+            lo=0, hi=100000, unit="字",
+            help="0 = 不限制，超了从最旧的丢。"),
+    Setting("runtime.max_msg_chars", "advanced", "单条消息截断长度", "int", default=500,
+            lo=0, hi=10000, unit="字",
+            help="0 = 不限制。"),
+    # ---- 记录与采样频率（从「会话与记录」挪来）----
+    Setting("history.max_per_session", "advanced", "每会话最多保留", "int", default=500,
+            lo=20, hi=10000, unit="条", restart=True, help="超了删最旧的。"),
+
+    # ---- 知识库 ----
+    # ⚠️ 这一组只有下面这一项是 SPEC 项：**开关**。
+    #    文件清单（导入/移除/预览）是手写控件，见 `settings_ui._build_kb_files`。
+    # ⚠️ 出厂 **关**（用户要求）：导第一份资料之前，这套东西完全不存在。
+    # ⚠️ 它**不用重启**：每次生成前都现读，改完立刻生效。
+    Setting("record.interval", "advanced", "记录间隔", "float", default=1.0, lo=0.5, hi=60.0,
+            unit="秒", restart=True,
+            help="别低于 0.5 秒。"),
+    Setting("record.fast_interval", "advanced", "快速档间隔", "float", default=0.2,
+            lo=0.0, hi=10.0, unit="秒", restart=True,
+            help="有新消息时用这个间隔。0 = 关。"),
+    Setting("record.fast_hold", "advanced", "快速档保持", "float", default=3.0,
+            lo=0.0, hi=60.0, unit="秒", restart=True,
+            help="变过之后保持快读多久。"),
+    Setting("ocr_read.probe_interval", "advanced", "检查间隔（安静）", "float",
+            default=1.0, lo=0.25, hi=30.0, unit="秒", restart=True,
+            help="调小更灵敏、更费电。"),
+    Setting("ocr_read.probe_fast", "advanced", "检查间隔（变化中）", "float",
+            default=0.5, lo=0.5, hi=5.0, unit="秒", restart=True,
+            help="别低于 0.5 秒。"),
+    # ⚠️ 2026-10-13 **删掉「OCR 模式记录间隔」**：产品代码里没有消费者
+    #    （OCR 连续记录那条路读的是 `record.interval`），选它不会有任何效果。
+    Setting("trigger.min_interval", "advanced", "两次触发最小间隔", "float", default=3.0,
+            lo=0.0, hi=120.0, unit="秒", help="撞得太近的会被忽略。"),
+    Setting("trigger.cooldown_after_copy", "advanced", "复制后冷静期", "float", default=20.0,
+            lo=0.0, hi=600.0, unit="秒",
+            help="复制后这段时间不自动触发。"),
+    # ⚠️ `reply.use_cursor_anchor`（「用鼠标位置定位回复目标」）原来在这块，
+    #    2026-10-14 用户要求「把鼠标定位放在行为里面」→ 挪到上面「行为」那一组了。
+    # ---- 上下文的闸（从「行为」挪来）----
+    Setting("ui.min_width", "advanced", "缩窄下限", "int", default=200, lo=120, hi=400,
+            unit="px",
+            help="放不下就不再跟随。"),
+    Setting("ui.width_max", "advanced", "宽度上限", "int", default=640, lo=240, hi=1200,
+            unit="px",
+            help="拖宽时的上限。"),
+    Setting("ui.follow_interval", "advanced", "跟随检查间隔", "float", default=0.016,
+            lo=0.008, hi=2.0, unit="秒",
+            help="调大省电，但会一跳一跳。"),
+    Setting("style.max_samples", "advanced", "样本条数", "int", default=12, lo=0, hi=50,
+            unit="条"),
+    Setting("style.max_length", "advanced", "样本长度上限", "int", default=60, lo=10, hi=500,
+            unit="字", help="超过就不要了（长段落不代表说话）。"),
+
+    # ---- 外观 ----
+    Setting("kb.top_k", "advanced", "带几段资料", "int", default=3, lo=1, hi=5,
+            unit="段", help="多了更全，也更贵。"),
+    Setting("kb.max_chars", "advanced", "资料总字数", "int", default=600,
+            lo=100, hi=2000, unit="字",
+            help="超了从后面截掉。"),    Setting("state.path", "advanced", "运行数据文件", "text", default="state/state.json",
             restart=True),
     Setting("history.path", "advanced", "聊天记录文件", "text", default="state/history.db",
             restart=True),
@@ -488,60 +519,14 @@ SPEC: List[Setting] = [
     #    所以一直是默认关 —— 既然没人该打开，就别摆在界面上。
     #    ⚠️ `trigger.py` / `run_watch.py` **照旧读它们**（纯 `.get(..., False)`），
     #    值恒为假 = 行为与之前完全一致；想恢复只需要把这两行 `Setting(...)` 加回来。
-    Setting("trigger.min_interval", "advanced", "两次触发最小间隔", "float", default=3.0,
-            lo=0.0, hi=120.0, unit="秒", help="两次触发至少隔这么久，撞得太近的会被忽略。"),
-    Setting("trigger.cooldown_after_copy", "advanced", "复制后冷静期", "float", default=20.0,
-            lo=0.0, hi=600.0, unit="秒",
-            help="这段时间内不自动触发（你正在去微信粘贴的路上）。"),
-    # ⚠️ `reply.use_cursor_anchor`（「用鼠标位置定位回复目标」）原来在这块，
-    #    2026-10-14 用户要求「把鼠标定位放在行为里面」→ 挪到上面「行为」那一组了。
-    # ---- 上下文的闸（从「行为」挪来）----
-    Setting("runtime.max_chars", "advanced", "上下文总长上限", "int", default=4000,
-            lo=0, hi=100000, unit="字",
-            help="0 = 不限制。带的历史超过这个长度，就从最旧的开始丢。"),
-    Setting("runtime.max_msg_chars", "advanced", "单条消息截断长度", "int", default=500,
-            lo=0, hi=10000, unit="字",
-            help="0 = 不限制。单条太长的（比如粘贴进来一大段）会被截断，"
-                 "免得一条就把上下文挤满。"),
-    # ---- 记录与采样频率（从「会话与记录」挪来）----
-    Setting("record.interval", "advanced", "记录间隔", "float", default=1.0, lo=0.5, hi=60.0,
-            unit="秒", restart=True,
-            help="多久读一次聊天内容。别低于 0.5 秒。"),
-    Setting("record.fast_interval", "advanced", "快速档间隔", "float", default=0.2,
-            lo=0.0, hi=10.0, unit="秒", restart=True,
-            help="翻记录、来新消息时用这个更快的间隔，安静下来自动回到上面的间隔。"
-                 "填 0 = 关掉。"),
-    Setting("record.fast_hold", "advanced", "快速档保持", "float", default=3.0,
-            lo=0.0, hi=60.0, unit="秒", restart=True,
-            help="内容变过之后，保持快读多久再回落。"),
-    Setting("ocr_read.probe_interval", "advanced", "看一眼的间隔（安静时）", "float",
-            default=1.0, lo=0.25, hi=30.0, unit="秒", restart=True,
-            help="安静时多久看一眼屏幕。调小更灵敏、更费电。"),
-    Setting("ocr_read.probe_fast", "advanced", "看一眼的间隔（内容在变时）", "float",
-            default=0.5, lo=0.5, hi=5.0, unit="秒", restart=True,
-            help="翻记录、来新消息时多久看一眼。别低于 0.5 秒，否则来不及读完。"),
-    # ⚠️ 2026-10-13 **删掉「OCR 模式记录间隔」**：产品代码里没有消费者
-    #    （OCR 连续记录那条路读的是 `record.interval`），选它不会有任何效果。
-    Setting("history.max_per_session", "advanced", "每会话最多保留", "int", default=500,
-            lo=20, hi=10000, unit="条", restart=True, help="超出后自动删最旧的。"),
+    Setting("update.mirror", "advanced", "更新加速地址", "text", default="",
+            help="下载慢时填，例如 https://ghfast.top/ 。"),
+    # ⚠️ 2026-10-13：「随机性」从常用组挪进「高级」。
+    #    代码**真的在用**它（`ai.py:93` 读、`ai.py:192` 随请求发出去），不是死变量；
+    #    但默认 1.0 = 模型自己的默认值，等于「没设」——
+    #    而改了它**看不出效果**（只影响措辞的飘不飘），属于"调完就不动"的那一类。
+    #    判据同 `test_settings.py` 第 8 节：数值调参一律放「高级」。
 
-    # ---- 知识库 ----
-    # ⚠️ 这一组只有下面这一项是 SPEC 项：**开关**。
-    #    文件清单（导入/移除/预览）是手写控件，见 `settings_ui._build_kb_files`。
-    # ⚠️ 出厂 **关**（用户要求）：导第一份资料之前，这套东西完全不存在。
-    # ⚠️ 它**不用重启**：每次生成前都现读，改完立刻生效。
-    Setting("kb.enabled", "kb", "启用知识库", "bool", default=False,
-            help="构建属于自己的知识库，可检索相关内容后发给模型。"),
-
-    # 下面两项"调完就不动"，进「高级」（判据见 `test_settings.py` 第 12 节）。
-    # ⚠️ `kb.min_ratio` / `kb.chunk_chars` **故意不进设置界面**：
-    #    一个是 0~1 的分数门槛、一个是切片长度，给用户看不加价值只会挑错。
-    #    它们由 `kb.py` 的默认值承担（代码里读，不是死变量）。
-    Setting("kb.top_k", "advanced", "带几段资料", "int", default=3, lo=1, hi=5,
-            unit="段", help="一次最多塞几段给模型。多了更全，也更贵。"),
-    Setting("kb.max_chars", "advanced", "资料总字数", "int", default=600,
-            lo=100, hi=2000, unit="字",
-            help="几段资料加起来的字数上限，超了从后面截掉。"),
 ]
 
 SPEC_BY_KEY: Dict[str, Setting] = {s.key: s for s in SPEC}
