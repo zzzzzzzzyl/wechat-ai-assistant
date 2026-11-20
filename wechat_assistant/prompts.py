@@ -230,9 +230,21 @@ OUTPUT_SPEC = """【输出要求】
 2. replies：{n}条候选回复，同一个人不同心情随手打的；其中一条可以只有两三个字甚至单语气词"""
 
 
+#: 「可以联网查证」那一句（2026-11-09 加）。
+#:
+#: ⚠️ 只有**联网开着**时才拼进去：没开的时候说这句，模型会"假装查过"，
+#:    或者因为"查不到"而写得犹犹豫豫 —— 那比直接按记忆答更糟。
+#: ⚠️ 别写成"必须联网"：工具是**模型自己决定用不用**的，我们只给它这个许可，
+#:    同时把"查不到别编"说清楚（编造是这里最贵的一类错误）。
+WEB_SEARCH_HINT = (
+    "【联网】需要最新事实（价格、日期、新闻、人名、版本号）时，可以先联网查证；"
+    "查不到就按平时说话的样子写，**别编**，也别在回复里提「我查了」。"
+    "\n\n")
+
+
 def render_system(user_text: str, persona: str = "", relationship: str = "",
                   style_samples=None, user_intent: str = "",
-                  n_replies: int = 3) -> str:
+                  n_replies: int = 3, web_search: bool = False) -> str:
     """把**用户正文**（设置里那个框）+ 外面的几块，拼成最终的 system prompt。
 
     ⚠️⚠️ 参数名是 `user_text`，装的**只是中间那两段规则**
@@ -281,7 +293,12 @@ def render_system(user_text: str, persona: str = "", relationship: str = "",
     #    那时**不要再拼一份**，否则同一段出现两次。
     head = PREFIX_TEMPLATE + ("" if "{intent}" in body else it)
     tail = "" if "{style}" in body else sty
-    out = head + body + "\n\n" + OUTPUT_SPEC + (("\n\n" + tail) if tail else "")
+    # ⚠️ 联网那句放在**输出要求之后、口吻样本之前**：
+    #    口吻样本一定要留在最后（它是变化最频繁的一块，见 PREFIX_TEMPLATE 的说明）。
+    web = WEB_SEARCH_HINT if web_search else ""
+    out = (head + body + "\n\n" + OUTPUT_SPEC
+           + (("\n\n" + web) if web else "")
+           + (("\n\n" + tail) if tail else ""))
     out = out.replace("{step2}", step2)
     out = out.replace("{n}", str(n_replies))
     out = out.replace("{persona}", (persona or "").strip() or "你是一个聊天助手。")

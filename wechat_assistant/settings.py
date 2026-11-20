@@ -322,6 +322,12 @@ SPEC: List[Setting] = [
                  ),
     Setting("ai.n_replies", "ai", "生成几条", "int", default=3, lo=1, hi=8, unit="条",
             level=1),
+    # ⚠️ 2026-11-09：**联网查证**（默认关）。开着时给模型挂服务商的搜索工具，
+    #    **由模型自己判断要不要查**。只在 DeepSeek 接口上用官方工具；
+    #    别的接口报 400 会自动退回不联网（见 `ai.chat`），不会把生成搞挂。
+    Setting("ai.web_search", "ai", "联网查证", "bool", default=False,
+            level=2,
+            help="需要最新消息时让它自己上网查。会多花一点钱，也会慢一点。"),
     Setting("ai.max_tokens", "advanced", "最长输出", "int", default=2000, lo=64, hi=8192,
             unit="token",
             help="一次最多输出多少。模型的「思考」也算在里面 —— 调小了可能光想不答，"

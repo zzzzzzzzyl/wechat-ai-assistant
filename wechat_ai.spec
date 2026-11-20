@@ -106,6 +106,11 @@ hiddenimports = [
     #    漏掉的症状很隐蔽：**打包后第二次双击 exe 什么都不发生**
     #    （单实例判不出来 = 又开一个，或者唤不出原窗口），而不是报错。
     "wechat_assistant.single_instance",
+    # ⚠️ 2026-11-09：开机自启模块也是**函数内懒加载**的
+    #    （`settings_ui._build_autostart` 里 `from .. import autostart`）——
+    #    静态分析可能看不全。漏掉的症状：**打包版点「开机自启」开关才报
+    #    ImportError**，而源码版一切正常；又因为它在该页最下面，很容易漏测。
+    "wechat_assistant.autostart",
     # ⚠️ 2026-10-17：知识库是**懒加载**的（`run_watch.main` 里 `if kb.enabled` 才 import，
     #    `settings_ui._kb()` 里也是函数内 import）—— 静态分析可能看不全。
     #    漏掉的症状：**打包版一打开知识库分组就报错 / 生成时静默没有参考资料**。

@@ -138,6 +138,20 @@ def collect_style_samples(messages, limit: int = 12, max_len: int = 60,
     return list(reversed(out))       # 恢复时间顺序
 
 
+#: **服务端联网工具**（2026-11-09 加）。
+#:
+#: 只在 **DeepSeek 接口**上认这个类型：声明一下即可，**是否搜索由模型判断**，
+#: 搜索和抓取都在服务端完成，客户端**不需要执行任何工具**（见官方《联网工具》）。
+#: ⚠️ `tool_choice` **不能**指定它（会 400）——
+#:    换句话说"什么时候搜"我们插不上手，只能开/关这一项。
+NATIVE_SEARCH_TOOL = {"type": "deepseek_web_search", "name": "deepseek_web_search"}
+
+
+def is_deepseek(base_url: str) -> bool:
+    """这个接口是不是 DeepSeek 官方（只有那里认 `deepseek_web_search`）。"""
+    return "deepseek.com" in (base_url or "").lower()
+
+
 class AIError(RuntimeError):
     """AI 调用失败。
 
@@ -170,6 +184,12 @@ class AIClient:
         #:    应该不是在这里吧，是不是要加到读取方式？”）。
         #: 关着的时候**一行代码都不走图**（老行为）。
         self.vision = bool(cfg.get("ocr_read.attach_image", False))
+        #: **联网查证**（2026-11-09 加，默认关）。开着时**由模型决定要不要搜**。
+        #: ⚠️ 只有 DeepSeek 接口认官方工具；别的接口见 `chat()` 里的 400 回退。
+        self.web_search = bool(cfg.get("ai.web_search", False))
+        #: 上一次生成**实际联网几次**（`usage.server_tool_use.tool_search`）。
+        #: ⚠️ 它影响成本，日志要报出来 —— 不然用户只看到"这次好贵"。
+        self.last_web_calls = 0
         self.timeout = float(cfg.get("ai.timeout", 60))
         self.temperature = float(cfg.get("ai.temperature", 1.0))
         self.max_tokens = int(cfg.get("ai.max_tokens", 800))
@@ -347,7 +367,30 @@ class AIClient:
             "max_tokens": self.max_tokens,
             "stream": False,
         }
-        data = self._post("/chat/completions", payload)
+        # ⚠️⚠️ 2026-11-09：**联网查证**（用户要求「让智能体来决定搜索」）。
+        #    · 只在 DeepSeek 接口上挂官方服务端工具 —— **搜不搜由模型判断**；
+        #    · 同时**必须关掉思考**：开着思考时这个工具会变成"深度思考搜索"
+        #      （最多调 20 次工具、边推理边检索），又慢又贵；关掉是简单联网搜索。
+        #    · 换别的厂商（或者代理）不认这个工具类型 → 见下面的 400 回退。
+        native_search = bool(self.web_search and is_deepseek(self.base_url)
+                             and not images)
+        if native_search:
+            payload["tools"] = [dict(NATIVE_SEARCH_TOOL)]
+            payload["thinking"] = {"type": "disabled"}
+        try:
+            data = self._post("/chat/completions", payload)
+        except AIError as e:
+            # ⚠️ 这家的接口不认官方联网工具（400）→ **去掉工具再试一次**，
+            #    别因为一个可选功能把整次生成搞挂。日志留一句，用户能知道"没联网"。
+            if native_search and e.code == 400:
+                self._log("[AI] 这家接口不认联网工具（400），本次不联网：%s"
+                          % (e.detail or "")[:120])
+                payload.pop("tools", None)
+                payload.pop("thinking", None)
+                native_search = False
+                data = self._post("/chat/completions", payload)
+            else:
+                raise
         # 记录 token 用量，便于核算成本
         usage = data.get("usage") or {}
         _details = usage.get("completion_tokens_details") or {}
@@ -363,7 +406,13 @@ class AIClient:
             #    没有这两个数，就永远不知道"把口吻样本挪到最后"到底赚了没有。
             "cache_hit_tokens": usage.get("prompt_cache_hit_tokens", 0) or 0,
             "cache_miss_tokens": usage.get("prompt_cache_miss_tokens", 0) or 0,
+            # ⚠️ 2026-11-09：**本次联网几次**（DeepSeek 回 `server_tool_use.tool_search`；
+            #    别的厂商没有这个字段就是 0）。它直接决定这次贵不贵 —— 搜索把结果
+            #    拼进上下文，实测一次查询输入从 600 涨到 2693 token。
+            "web_search_calls": int((usage.get("server_tool_use") or {})
+                                    .get("tool_search", 0) or 0),
         }
+        self.last_web_calls = self.last_usage["web_search_calls"]
         self.total_usage["calls"] += 1
         for k in ("prompt_tokens", "completion_tokens", "total_tokens"):
             self.total_usage[k] += self.last_usage.get(k, 0)
@@ -458,7 +507,10 @@ class AIClient:
         system = prompts.render_system(
             self.system_template, persona=persona, relationship=relationship,
             style_samples=style_samples, user_intent=user_intent,
-            n_replies=n_replies)
+            n_replies=n_replies,
+            # ⚠️ 2026-11-09：**联网开着时才**加"可以先联网查证"那句。
+            #    没开时也说，模型会"假装查过"或写得犹犹豫豫。
+            web_search=bool(self.web_search and is_deepseek(self.base_url)))
         # ⚠️ **输出格式现在由 `render_system` 在代码侧拼上**（`prompts.OUTPUT_SPEC`），
         #    用户那一框里只有他自己的规则 —— 所以这段**通常不会触发**。
         #    留着它是**防将来**：谁哪天把 `OUTPUT_SPEC` 从拼接里删掉，

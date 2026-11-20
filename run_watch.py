@@ -1423,6 +1423,12 @@ def main():
                     _hit = _u.get("cache_hit_tokens", 0)
                     if _hit:
                         _extra += "，缓存命中 %d" % _hit
+                    # ⚠️ 2026-11-09：**本次联网几次**。搜索会把结果拼进上下文，
+                    #    输入 token 会明显涨（实测一次查询 600→2693）——
+                    #    不报这个数，用户只看到"这次怎么这么贵"。
+                    _web = _u.get("web_search_calls", 0)
+                    if _web:
+                        _extra += "，联网 %d 次" % _web
                     log("本次用量: 入 %d + 出 %d = %d token%s%s"
                         % (_u["prompt_tokens"], _u["completion_tokens"],
                            _u["total_tokens"], _extra, _money))

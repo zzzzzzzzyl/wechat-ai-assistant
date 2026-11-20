@@ -431,6 +431,114 @@ def test_retry_and_errors():
         ai_mod.RETRY_BACKOFF = old_backoff
 
 
+def test_web_search():
+    """联网查证（2026-11-09 加）：**由模型决定搜不搜**，我们只负责开/关。
+
+    守四件事：
+      1. 只有 DeepSeek 接口才挂官方工具（别的接口挂上去就是 400）；
+      2. 挂工具时**同时关思考**（否则变"深度思考搜索"，最多 20 次调用，又慢又贵）；
+      3. 接口不认工具（400）→ **自动去掉工具重试**，不让可选功能搞挂生成；
+      4. `usage.server_tool_use.tool_search` 要落到 `last_usage`（成本要看得见）。
+    """
+    import json
+    import urllib.error
+
+    import wechat_assistant.ai as ai_mod
+
+    class Cfg:
+        def __init__(self, **kw):
+            self._d = kw
+
+        def get(self, key, default=None):
+            return self._d.get(key, default)
+
+    class Resp:
+        def __init__(self, payload):
+            self._p = json.dumps(payload).encode("utf-8")
+
+        def read(self):
+            return self._p
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    OK_BODY = {"choices": [{"message": {"content": "ok"}}],
+               "usage": {"prompt_tokens": 2693, "completion_tokens": 20,
+                         "total_tokens": 2713,
+                         "server_tool_use": {"tool_search": 2}}}
+
+    old_open = ai_mod.urllib.request.urlopen
+    old_backoff = ai_mod.RETRY_BACKOFF
+    ai_mod.RETRY_BACKOFF = (0.0, 0.0)
+    try:
+        print("\n1f. 联网查证（打桩 urlopen）")
+        seen = []
+
+        def capture(req, timeout=None):
+            seen.append(json.loads(req.data.decode("utf-8")))
+            return Resp(OK_BODY)
+
+        ai_mod.urllib.request.urlopen = capture
+
+        ds = AIClient(Cfg(**{"ai.api_key": "sk-x",
+                             "ai.base_url": "https://api.deepseek.com",
+                             "ai.model": "deepseek-flash", "ai.web_search": True}))
+        logs = []
+        ds._log = logs.append
+        ds.chat("s", "u")
+        check("DeepSeek 接口：payload 里挂了官方联网工具",
+              seen and seen[-1].get("tools") == [ai_mod.NATIVE_SEARCH_TOOL],
+              str(seen[-1].get("tools")))
+        check("挂工具时**同时关思考**（否则变深度思考搜索）",
+              (seen[-1].get("thinking") or {}).get("type") == "disabled",
+              str(seen[-1].get("thinking")))
+        check("usage 里的联网次数被记下来（成本看得见）",
+              ds.last_usage["web_search_calls"] == 2, str(ds.last_usage))
+        check("last_web_calls 也同步了", ds.last_web_calls == 2)
+
+        other = AIClient(Cfg(**{"ai.api_key": "sk-x",
+                                "ai.base_url": "https://api.openai.com/v1",
+                                "ai.model": "gpt-4o", "ai.web_search": True}))
+        other.chat("s", "u")
+        check("换别家接口：**不挂**官方工具（挂上去就是 400）",
+              "tools" not in seen[-1], str(sorted(seen[-1].keys())))
+
+        off = AIClient(Cfg(**{"ai.api_key": "sk-x",
+                              "ai.base_url": "https://api.deepseek.com",
+                              "ai.model": "m", "ai.web_search": False}))
+        off.chat("s", "u")
+        check("开关关着：也不挂工具", "tools" not in seen[-1])
+
+        # 400 回退：第一次带工具被拒，第二次去掉工具要成功
+        calls = {"n": 0}
+
+        def reject_first(req, timeout=None):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise urllib.error.HTTPError(req.full_url, 400, "Bad Request", {}, None)
+            seen.append(json.loads(req.data.decode("utf-8")))
+            return Resp(OK_BODY)
+
+        ai_mod.urllib.request.urlopen = reject_first
+        fb = AIClient(Cfg(**{"ai.api_key": "sk-x",
+                             "ai.base_url": "https://api.deepseek.com",
+                             "ai.model": "m", "ai.web_search": True}))
+        flog = []
+        fb._log = flog.append
+        out = fb.chat("s", "u")
+        check("400 时自动退回不联网，仍然拿到回复", out == "ok", repr(out))
+        check("  重试的那次**没带** tools", "tools" not in seen[-1],
+              str(sorted(seen[-1].keys())))
+        check("  日志说清了「本次不联网」",
+              any("不联网" in m for m in flog), repr(flog[-2:]))
+    finally:
+        ai_mod.urllib.request.urlopen = old_open
+        ai_mod.RETRY_BACKOFF = old_backoff
+
+
 def main():
     offline = "--offline" in sys.argv
     print("=" * 80)
@@ -441,6 +549,7 @@ def main():
     test_prompt_template()
     test_missing_config()
     test_retry_and_errors()
+    test_web_search()
     test_build_prompts_appends_format()
     test_reply_target_wording()
 
