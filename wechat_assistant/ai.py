@@ -138,17 +138,13 @@ def collect_style_samples(messages, limit: int = 12, max_len: int = 60,
     return list(reversed(out))       # 恢复时间顺序
 
 
-#: **服务端联网工具**（2026-11-09 加）。
-#:
-#: 只在 **DeepSeek 接口**上认这个类型：声明一下即可，**是否搜索由模型判断**，
-#: 搜索和抓取都在服务端完成，客户端**不需要执行任何工具**（见官方《联网工具》）。
-#: ⚠️ `tool_choice` **不能**指定它（会 400）——
-#:    换句话说"什么时候搜"我们插不上手，只能开/关这一项。
-NATIVE_SEARCH_TOOL = {"type": "deepseek_web_search", "name": "deepseek_web_search"}
+#: DeepSeek 的 **Search API**（2026-11-09 加）。走它而不是"服务端联网工具"，
+#: 原因写在 `prompts.SEARCH_PLAN_SYSTEM` 上面那段实测里：挂工具那次调用**基本不搜**。
+SEARCH_PATH = "/v1/tools/search"
 
 
 def is_deepseek(base_url: str) -> bool:
-    """这个接口是不是 DeepSeek 官方（只有那里认 `deepseek_web_search`）。"""
+    """这个接口是不是 DeepSeek 官方（Search API 只在那儿有）。"""
     return "deepseek.com" in (base_url or "").lower()
 
 
@@ -318,6 +314,85 @@ class AIClient:
                     detail="%s: %s" % (type(e).__name__, e),
                     retriable=retriable) from e
 
+    # ------------------------------------------------------------ 联网查证（两段式）
+
+    def plan_search(self, current: str, intent: str = "") -> str:
+        """**第 1 段**：让模型判断这句话要不要联网、要查什么。返回查询词（空串 = 不查）。
+
+        ⚠️ 一次**很便宜**的调用：非思考、`max_tokens=60`、temperature=0
+            （实测约 200 输入 token，¥0.0002/次）。
+        ⚠️ 任何失败都**返回空串**，绝不抛 —— 联网是可选功能，
+            不能让它把"回一句微信"搞挂。
+        ⚠️ 只在**DeepSeek 接口**上做：Search API 只有它家有。
+        """
+        self.last_web_calls = 0
+        if not (self.web_search and is_deepseek(self.base_url) and self.available):
+            return ""
+        text = (current or "").strip()
+        if not text:
+            return ""
+        user = "我想说：%s\n对方/当前屏幕：%s" % ((intent or "").strip() or "（没说）", text[:600])
+        payload = {
+            "model": self.model,
+            "messages": [{"role": "system", "content": prompts.SEARCH_PLAN_SYSTEM},
+                         {"role": "user", "content": user}],
+            "temperature": 0,
+            "max_tokens": 60,
+            "stream": False,
+            "thinking": {"type": "disabled"},
+        }
+        try:
+            data = self._post("/chat/completions", payload)
+            raw = ((data.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+            # 模型偶尔会包一层 ```json；`parse_replies` 里那套剥壳逻辑这里用不上，
+            # 直接找最外层的花括号。
+            s = raw[raw.find("{"):raw.rfind("}") + 1] if "{" in raw else ""
+            plan = json.loads(s) if s else {}
+            q = str(plan.get("query") or "").strip()
+            if plan.get("need") and q:
+                return q[:128]
+        except Exception as e:
+            self._log("[联网] 判断失败（这次不查）: %s: %s" % (type(e).__name__, e))
+        return ""
+
+    def fetch_web(self, query: str, count: int = 3) -> str:
+        """**第 2 段**：调 Search API，把结果拼成能塞进 prompt 的一段字（失败返回空串）。
+
+        ⚠️ 走 `/v1/tools/search`（官方 Search API，¥5/1000 次成功请求，失败不计费）。
+        ⚠️ 每项优先用 `summary`（600~800 字，给模型读的），没有再退回 `snippet`。
+        ⚠️ 失败/没结果都返回空串：**别把失败写成"没查到"塞进 prompt**，那会让模型
+            以为事实是"没有这回事"。
+        """
+        self.last_web_calls = 0
+        if not (query or "").strip():
+            return ""
+        try:
+            data = self._post(SEARCH_PATH, {
+                "query": query.strip()[:128],
+                "count": max(1, min(int(count), 10)),
+                "need_content": False,
+            })
+            results = data.get("results") or []
+            lines = []
+            for r in results:
+                s = (r.get("summary") or r.get("snippet") or "").strip()
+                if not s:
+                    continue
+                # ⚠️ 一行一条、不写 URL：URL 会诱使模型在回复里贴链接，
+                #    而"回微信"里贴链接非常像机器人。
+                # ⚠️ 每条砍到 220 字：默认 `count=3` 时总共约 600~700 字（≈500 token），
+                #    比"5 条 × 400 字"省一半多，够模型说清事实了。
+                lines.append("- " + " ".join(s.split())[:220])
+                if len(lines) >= int(count):
+                    break
+            if not lines:
+                return ""
+            self.last_web_calls = 1
+            return prompts.WEB_BLOCK % "\n".join(lines)
+        except Exception as e:
+            self._log("[联网] 搜索失败（这次不带资料）: %s: %s" % (type(e).__name__, e))
+            return ""
+
     def _get(self, path: str) -> dict:
         url = self.base_url + path
         req = urllib.request.Request(url)
@@ -367,30 +442,12 @@ class AIClient:
             "max_tokens": self.max_tokens,
             "stream": False,
         }
-        # ⚠️⚠️ 2026-11-09：**联网查证**（用户要求「让智能体来决定搜索」）。
-        #    · 只在 DeepSeek 接口上挂官方服务端工具 —— **搜不搜由模型判断**；
-        #    · 同时**必须关掉思考**：开着思考时这个工具会变成"深度思考搜索"
-        #      （最多调 20 次工具、边推理边检索），又慢又贵；关掉是简单联网搜索。
-        #    · 换别的厂商（或者代理）不认这个工具类型 → 见下面的 400 回退。
-        native_search = bool(self.web_search and is_deepseek(self.base_url)
-                             and not images)
-        if native_search:
-            payload["tools"] = [dict(NATIVE_SEARCH_TOOL)]
-            payload["thinking"] = {"type": "disabled"}
-        try:
-            data = self._post("/chat/completions", payload)
-        except AIError as e:
-            # ⚠️ 这家的接口不认官方联网工具（400）→ **去掉工具再试一次**，
-            #    别因为一个可选功能把整次生成搞挂。日志留一句，用户能知道"没联网"。
-            if native_search and e.code == 400:
-                self._log("[AI] 这家接口不认联网工具（400），本次不联网：%s"
-                          % (e.detail or "")[:120])
-                payload.pop("tools", None)
-                payload.pop("thinking", None)
-                native_search = False
-                data = self._post("/chat/completions", payload)
-            else:
-                raise
+        # ⚠️⚠️ 2026-11-09：**联网不在这里做**。原来往这次生成里挂
+        #    `deepseek_web_search` 工具，实测在"写微信回复"的任务里**基本不搜**
+        #    （详见 `prompts.SEARCH_PLAN_SYSTEM` 上方那段实测记录）。
+        #    现在是两段式：`plan_search()` 判断 → `fetch_web()` 查 → 结果拼进
+        #    `extra_context`（和知识库同一条通道）。所以这里 payload 保持原样。
+        data = self._post("/chat/completions", payload)
         # 记录 token 用量，便于核算成本
         usage = data.get("usage") or {}
         _details = usage.get("completion_tokens_details") or {}
@@ -406,13 +463,9 @@ class AIClient:
             #    没有这两个数，就永远不知道"把口吻样本挪到最后"到底赚了没有。
             "cache_hit_tokens": usage.get("prompt_cache_hit_tokens", 0) or 0,
             "cache_miss_tokens": usage.get("prompt_cache_miss_tokens", 0) or 0,
-            # ⚠️ 2026-11-09：**本次联网几次**（DeepSeek 回 `server_tool_use.tool_search`；
-            #    别的厂商没有这个字段就是 0）。它直接决定这次贵不贵 —— 搜索把结果
-            #    拼进上下文，实测一次查询输入从 600 涨到 2693 token。
-            "web_search_calls": int((usage.get("server_tool_use") or {})
-                                    .get("tool_search", 0) or 0),
         }
-        self.last_web_calls = self.last_usage["web_search_calls"]
+        # ⚠️ 2026-11-09：`last_web_calls` **不再从 usage 里读**（两段式之后搜索是我们自己
+        #    调的 Search API，不是服务端工具），由 `fetch_web()` 自己置 1/0。
         self.total_usage["calls"] += 1
         for k in ("prompt_tokens", "completion_tokens", "total_tokens"):
             self.total_usage[k] += self.last_usage.get(k, 0)
@@ -507,10 +560,9 @@ class AIClient:
         system = prompts.render_system(
             self.system_template, persona=persona, relationship=relationship,
             style_samples=style_samples, user_intent=user_intent,
-            n_replies=n_replies,
-            # ⚠️ 2026-11-09：**联网开着时才**加"可以先联网查证"那句。
-            #    没开时也说，模型会"假装查过"或写得犹犹豫豫。
-            web_search=bool(self.web_search and is_deepseek(self.base_url)))
+            n_replies=n_replies)
+        # ⚠️ 2026-11-09：**联网资料不走 system**，走 `extra_context` 里的【联网资料】
+        #    —— 只有真查到东西才出现（见 `AIClient.fetch_web` 与 `run_watch` 的接线）。
         # ⚠️ **输出格式现在由 `render_system` 在代码侧拼上**（`prompts.OUTPUT_SPEC`），
         #    用户那一框里只有他自己的规则 —— 所以这段**通常不会触发**。
         #    留着它是**防将来**：谁哪天把 `OUTPUT_SPEC` 从拼接里删掉，

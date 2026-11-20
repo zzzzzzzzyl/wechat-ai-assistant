@@ -395,8 +395,7 @@ _IMAGE_PLACEHOLDER = "[图片]"
 _IMG_MAX_SIDE = 1024
 
 
-def _crop_images_from_window(hwnd: int, rects, limit: int = None,
-                             logger=None) -> List[str]:
+def _crop_images_from_window(hwnd: int, rects, limit: int = None) -> List[str]:
     """按**屏幕坐标**抓一张窗口位图，裁出图片消息的本体（base64）。
 
     ⚠️ UIA 后端**从来不抓图**（它只读控件树），而图片消息的
@@ -407,10 +406,10 @@ def _crop_images_from_window(hwnd: int, rects, limit: int = None,
           （rects 是按屏上顺序来的，后面的是更靠下的 = 更新的）；
         · **体积**：统一走 `capture.encode_for_model()` —— JPEG + 300KB 预算，
           不再存 PNG（照片类 PNG 能到 1~2MB，视觉模型按图算 token）。
+    ⚠️ 本函数**不打日志**（每拍都会调），日志由调用方按"值变了才报"来打。
     """
     from . import capture
 
-    log = logger or (lambda m: None)
     try:
         wrect = win32gui.GetWindowRect(hwnd)
     except Exception:
@@ -422,9 +421,8 @@ def _crop_images_from_window(hwnd: int, rects, limit: int = None,
     if limit is None:
         limit = capture.IMG_MAX_COUNT
     limit = int(limit)
-    skipped = max(0, len(rects) - limit) if limit > 0 else 0
     if limit > 0:
-        rects = rects[-limit:]
+        rects = rects[-limit:]        # 只发**最近**的几张
     crops = []
     for r in rects:
         sub = capture.crop_window_region(img, wrect, r)
@@ -434,12 +432,10 @@ def _crop_images_from_window(hwnd: int, rects, limit: int = None,
     # ⚠️ 2026-11-09：同一张图被连发两遍时，一次请求里带两张一样的 = 白花 token。
     crops, dup = capture.dedupe_crops(crops)
     out = [capture.encode_for_model(sub) for sub in crops]
-    if out:
-        _extra = ("，另有 %d 张没发（上限 %d）" % (skipped, limit)) if skipped else ""
-        if dup:
-            _extra += "，去重 %d 张" % dup
-        log("附带 %d 张图片给模型看（约 %d KB）%s"
-            % (len(out), capture.kb_of(out), _extra))
+    # ⚠️⚠️ **这里不要再打日志**：本函数**每拍都会被调**（记录器 / 面板 / 预览各一次），
+    #    以前那行"附带 N 张图片给模型看"就在这儿，结果用户看到控制台每秒刷 5 条相同的。
+    #    现在由调用方（`WeChatReader.read_chat`）**值变了才报** —— 见那里的 `_img_logged`。
+    #    （`dup` / `skipped` 由调用方自己算，不从这里回传。）
     return out
 
 
@@ -746,8 +742,19 @@ class WeChatReader:
             if image_rects and self.cfg.get("ocr_read.attach_image"):
                 snap.images = _crop_images_from_window(
                     hwnd, image_rects,
-                    limit=self.cfg.get("ocr_read.max_images", None),
-                    logger=self._log)
+                    limit=self.cfg.get("ocr_read.max_images", None))
+                # ⚠️⚠️ 2026-11-09：这行日志原来在 `_crop_images_from_window` 里、**每拍都打**
+                #    —— 用户报「控制台每秒重复『附带 1 张图片给模型看（约 14 KB）』」，
+                #    实测同一秒能刷 5 条（记录器 / 面板 / 预览各读一次，每次都打）。
+                #    按项目铁律"每拍都会发生的事，日志必须节流"：**值变了才报**。
+                _kb = int(sum(len(s) for s in snap.images) * 3 / 4 / 1024)
+                _note = (len(snap.images), _kb)
+                if _note != getattr(self, "_img_logged", None):
+                    self._img_logged = _note
+                    if snap.images:
+                        self._log("附带 %d 张图片给模型看（约 %d KB）" % _note)
+                    else:
+                        self._log("本屏没有可发的图片（开关是开的）")
             label_unknown_senders(snap)
             return snap
 

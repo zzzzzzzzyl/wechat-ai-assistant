@@ -1362,6 +1362,31 @@ def main():
                             % (type(e).__name__, e))
                 else:
                     log("[KB] 这个会话没开知识库（会话面板里可以打开）")
+
+            # ---- 联网查证（2026-11-09，**两段式**）----------------------------
+            # ⚠️⚠️ 为什么不在正式生成那次调用里挂服务商工具：实测「写微信回复」的
+            #    任务下它**基本不搜**（提示词写"可以"→ 0 次；写"必须"仍 0 次，
+            #    还会诱发编造；只有开思考才真搜，但入 11040 token）。
+            #    现在：① 一次便宜调用让模型判断"要不要查、查什么"；
+            #          ② 我们调 Search API 拿结果，拼成【联网资料】塞进 extra_context
+            #            （和知识库**同一条通道**）；
+            #          ③ 正式生成照旧。
+            # ⚠️ 三道保险：只在 DeepSeek 接口、只在开关开着、任何失败都当"没联网"。
+            if ai is not None and cfg.get("ai.web_search", False):
+                try:
+                    _q = ai.plan_search(current_text, user_intent or "")
+                    if _q:
+                        _web = ai.fetch_web(_q)
+                        if _web:
+                            extra_context = ((extra_context + "\n" + _web)
+                                             if extra_context else _web)
+                            log("联网查证:「%s」-> %d 条资料进 prompt"
+                                % (_q[:30], _web.count("- ")))
+                        else:
+                            log("联网查证:「%s」没查到东西，这次不带资料" % _q[:30])
+                except Exception as e:
+                    # 可选功能，失败绝不影响生成
+                    log("联网查证失败（这次不联网）: %s: %s" % (type(e).__name__, e))
             try:
                 # ⚠️ 图片只有 `ocr_read.attach_image` 打开时才会有
                 #    （见 `OcrReader._crop_images` / `reader._crop_images_from_window`）；
@@ -1423,12 +1448,12 @@ def main():
                     _hit = _u.get("cache_hit_tokens", 0)
                     if _hit:
                         _extra += "，缓存命中 %d" % _hit
-                    # ⚠️ 2026-11-09：**本次联网几次**。搜索会把结果拼进上下文，
-                    #    输入 token 会明显涨（实测一次查询 600→2693）——
-                    #    不报这个数，用户只看到"这次怎么这么贵"。
-                    _web = _u.get("web_search_calls", 0)
-                    if _web:
-                        _extra += "，联网 %d 次" % _web
+                    # ⚠️ 2026-11-09：**本次联网几次**。两段式之后搜索是**我们自己**调的
+                    #    Search API，所以次数不来自 `usage`，而是 `fetch_web()` 记的
+                    #    `ai.last_web_calls`（0/1）。搜索会把结果拼进上下文，
+                    #    输入 token 会明显涨 —— 不报这个数，用户只看到"这次怎么这么贵"。
+                    if getattr(ai, "last_web_calls", 0):
+                        _extra += "，联网 1 次（约 ¥0.005）"
                     log("本次用量: 入 %d + 出 %d = %d token%s%s"
                         % (_u["prompt_tokens"], _u["completion_tokens"],
                            _u["total_tokens"], _extra, _money))

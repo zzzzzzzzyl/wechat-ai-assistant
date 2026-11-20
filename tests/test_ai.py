@@ -432,16 +432,23 @@ def test_retry_and_errors():
 
 
 def test_web_search():
-    """联网查证（2026-11-09 加）：**由模型决定搜不搜**，我们只负责开/关。
+    """联网查证（2026-11-09 加，当天从"挂工具"改成**两段式**）。
 
-    守四件事：
-      1. 只有 DeepSeek 接口才挂官方工具（别的接口挂上去就是 400）；
-      2. 挂工具时**同时关思考**（否则变"深度思考搜索"，最多 20 次调用，又慢又贵）；
-      3. 接口不认工具（400）→ **自动去掉工具重试**，不让可选功能搞挂生成；
-      4. `usage.server_tool_use.tool_search` 要落到 `last_usage`（成本要看得见）。
+    为什么改：挂 `deepseek_web_search` 让模型自己决定，实测在"写微信回复"的任务里
+    **基本不搜**（提示词写"可以"→0 次；写"必须"→仍 0 次还会诱发编造）。
+    现在是：① `plan_search()` 一次便宜调用判断"要不要查、查什么"；
+            ② `fetch_web()` 调 Search API 拿结果；
+            ③ 结果拼进 `extra_context`（和知识库同一条通道）。
+
+    这条守六件事：
+      1. 只有 DeepSeek 接口才查（Search API 只在那儿有）；
+      2. 判断调用是**非思考 + 短输出**（便宜）；
+      3. 模型说「不用查」时**不发搜索**；
+      4. 搜到的内容**不带 URL**（回微信里贴链接像机器人），每条截断；
+      5. 任何失败都返回空串、**不抛**（可选功能不许搞挂生成）；
+      6. `last_web_calls` 要对（日志里那句"联网 1 次（约 ¥0.005）"靠它）。
     """
     import json
-    import urllib.error
 
     import wechat_assistant.ai as ai_mod
 
@@ -452,91 +459,101 @@ def test_web_search():
         def get(self, key, default=None):
             return self._d.get(key, default)
 
-    class Resp:
-        def __init__(self, payload):
-            self._p = json.dumps(payload).encode("utf-8")
+    print("\n1f. 联网查证（两段式，打桩 _post）")
 
-        def read(self):
-            return self._p
+    def make(base="https://api.deepseek.com", on=True):
+        c = AIClient(Cfg(**{"ai.api_key": "sk-x", "ai.base_url": base,
+                            "ai.model": "m", "ai.web_search": on}))
+        c.logs = []
+        c._log = c.logs.append
+        return c
 
-        def __enter__(self):
-            return self
+    # ---- 第 1 段：判断要不要查 ----
+    seen = []
 
-        def __exit__(self, *a):
-            return False
+    def fake_post(path, payload):
+        seen.append((path, payload))
+        if path == ai_mod.SEARCH_PATH:
+            return {"results": []}
+        return {"choices": [{"message": {"content":
+                '{"need": true, "query": "杭州 明天 天气"}'}}]}
 
-    OK_BODY = {"choices": [{"message": {"content": "ok"}}],
-               "usage": {"prompt_tokens": 2693, "completion_tokens": 20,
-                         "total_tokens": 2713,
-                         "server_tool_use": {"tool_search": 2}}}
+    c = make()
+    c._post = fake_post
+    q = c.plan_search("明天天气怎么样", "")
+    check("模型说要查时返回查询词", q == "杭州 明天 天气", repr(q))
+    _path, _pl = seen[-1]
+    check("判断调用走的是 chat/completions", _path == "/chat/completions", _path)
+    check("判断调用**关思考**（便宜、快）",
+          (_pl.get("thinking") or {}).get("type") == "disabled",
+          str(_pl.get("thinking")))
+    check("判断调用输出很短（max_tokens=60）", _pl.get("max_tokens") == 60,
+          str(_pl.get("max_tokens")))
 
-    old_open = ai_mod.urllib.request.urlopen
-    old_backoff = ai_mod.RETRY_BACKOFF
-    ai_mod.RETRY_BACKOFF = (0.0, 0.0)
-    try:
-        print("\n1f. 联网查证（打桩 urlopen）")
-        seen = []
+    def fake_chat(content):
+        def _p(path, payload):
+            return {"choices": [{"message": {"content": content}}]}
+        return _p
 
-        def capture(req, timeout=None):
-            seen.append(json.loads(req.data.decode("utf-8")))
-            return Resp(OK_BODY)
+    c2 = make()
+    c2._post = fake_chat('{"need": false, "query": ""}')
+    check("模型说「不用查」时返回空串", c2.plan_search("你吃了吗", "") == "")
 
-        ai_mod.urllib.request.urlopen = capture
+    c3 = make()
+    c3._post = fake_chat("我看看啊")          # 不是 JSON
+    check("模型胡说时不崩、当「不查」", c3.plan_search("在吗", "") == "")
 
-        ds = AIClient(Cfg(**{"ai.api_key": "sk-x",
-                             "ai.base_url": "https://api.deepseek.com",
-                             "ai.model": "deepseek-flash", "ai.web_search": True}))
-        logs = []
-        ds._log = logs.append
-        ds.chat("s", "u")
-        check("DeepSeek 接口：payload 里挂了官方联网工具",
-              seen and seen[-1].get("tools") == [ai_mod.NATIVE_SEARCH_TOOL],
-              str(seen[-1].get("tools")))
-        check("挂工具时**同时关思考**（否则变深度思考搜索）",
-              (seen[-1].get("thinking") or {}).get("type") == "disabled",
-              str(seen[-1].get("thinking")))
-        check("usage 里的联网次数被记下来（成本看得见）",
-              ds.last_usage["web_search_calls"] == 2, str(ds.last_usage))
-        check("last_web_calls 也同步了", ds.last_web_calls == 2)
+    c_other = make(base="https://api.openai.com/v1")
+    called = []
+    c_other._post = lambda p, b: called.append(p) or {}
+    check("换别家接口**不查**（没有 Search API）",
+          c_other.plan_search("明天天气", "") == "" and not called)
 
-        other = AIClient(Cfg(**{"ai.api_key": "sk-x",
-                                "ai.base_url": "https://api.openai.com/v1",
-                                "ai.model": "gpt-4o", "ai.web_search": True}))
-        other.chat("s", "u")
-        check("换别家接口：**不挂**官方工具（挂上去就是 400）",
-              "tools" not in seen[-1], str(sorted(seen[-1].keys())))
+    c_off = make(on=False)
+    called2 = []
+    c_off._post = lambda p, b: called2.append(p) or {}
+    check("开关关着**不查**",
+          c_off.plan_search("明天天气", "") == "" and not called2)
 
-        off = AIClient(Cfg(**{"ai.api_key": "sk-x",
-                              "ai.base_url": "https://api.deepseek.com",
-                              "ai.model": "m", "ai.web_search": False}))
-        off.chat("s", "u")
-        check("开关关着：也不挂工具", "tools" not in seen[-1])
+    # ---- 第 2 段：调 Search API ----
+    hits = []
 
-        # 400 回退：第一次带工具被拒，第二次去掉工具要成功
-        calls = {"n": 0}
+    def fake_search(path, payload):
+        hits.append((path, payload))
+        return {"results": [
+            {"summary": "杭州明天多云，20~27 度。", "url": "https://a.example/x"},
+            {"summary": "下周有雨。", "url": "https://b.example/y"},
+            {"snippet": "只有 snippet 也能用", "url": "https://c.example/z"},
+        ]}
 
-        def reject_first(req, timeout=None):
-            calls["n"] += 1
-            if calls["n"] == 1:
-                raise urllib.error.HTTPError(req.full_url, 400, "Bad Request", {}, None)
-            seen.append(json.loads(req.data.decode("utf-8")))
-            return Resp(OK_BODY)
+    c4 = make()
+    c4._post = fake_search
+    blk = c4.fetch_web("杭州 明天 天气")
+    check("搜到东西时拼成【联网资料】", "【联网资料" in blk and "- 杭州明天多云" in blk,
+          blk[:60])
+    check("  不带 URL（回微信里贴链接像机器人）", "http" not in blk, blk[:80])
+    check("  三条都进来了（summary 缺失时退回 snippet）",
+          blk.count("- ") == 3 and "只有 snippet" in blk, str(blk.count("- ")))
+    check("  走的是 /v1/tools/search", hits[-1][0] == ai_mod.SEARCH_PATH, hits[-1][0])
+    check("  默认只取 3 条（省 token）", hits[-1][1].get("count") == 3,
+          str(hits[-1][1].get("count")))
+    check("  记下「这次联网了」（日志要用）", c4.last_web_calls == 1,
+          str(c4.last_web_calls))
 
-        ai_mod.urllib.request.urlopen = reject_first
-        fb = AIClient(Cfg(**{"ai.api_key": "sk-x",
-                             "ai.base_url": "https://api.deepseek.com",
-                             "ai.model": "m", "ai.web_search": True}))
-        flog = []
-        fb._log = flog.append
-        out = fb.chat("s", "u")
-        check("400 时自动退回不联网，仍然拿到回复", out == "ok", repr(out))
-        check("  重试的那次**没带** tools", "tools" not in seen[-1],
-              str(sorted(seen[-1].keys())))
-        check("  日志说清了「本次不联网」",
-              any("不联网" in m for m in flog), repr(flog[-2:]))
-    finally:
-        ai_mod.urllib.request.urlopen = old_open
-        ai_mod.RETRY_BACKOFF = old_backoff
+    c5 = make()
+    c5._post = lambda p, b: {"results": []}
+    check("没搜到 -> 空串、且不算联网", c5.fetch_web("随便") == ""
+          and c5.last_web_calls == 0)
+
+    c6 = make()
+
+    def boom(path, payload):
+        raise AIError("HTTP 500: 服务端出错", code=500, detail="boom")
+
+    c6._post = boom
+    check("搜挂了也不抛（只返回空串）", c6.fetch_web("随便") == ""
+          and c6.last_web_calls == 0)
+    check("  日志里有一句能查的", any("联网" in m for m in c6.logs), repr(c6.logs))
 
 
 def main():

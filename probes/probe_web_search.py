@@ -1,88 +1,59 @@
-"""探针：确认服务商"模型自己决定要不要搜"的联网工具长什么样（2026-11-09）。
+"""探针：联网查证（两段式）—— 判断要不要查 + 真调 Search API（2026-11-09）。
 
-⚠️ 只作取证用：会**真花钱**、也真把内容发给服务商。产品代码不依赖它。
+⚠️ 只作取证用：会**真花钱**（搜索 ¥5/1000 次、判断调用几百 token）。
+   产品代码走的是同一条路：`AIClient.plan_search()` → `AIClient.fetch_web()`。
 
-已验证的结论（2026-11-09，DeepSeek `deepseek-flash`，Chat Completions）：
+⚠️ 为什么不是"服务端联网工具"（`tools: [deepseek_web_search]`）：
+    实测在「写微信回复」的任务里**基本不搜**（提示词写"可以"→0 次；写"必须"→仍 0 次
+    且会诱发编造；开思考才真搜，但入 11040 token）。详见 `设置项怎么改.md` §4d。
 
-    请求：
-        "tools": [{"type": "deepseek_web_search", "name": "deepseek_web_search"}]
-        "thinking": {"type": "disabled"}        # 否则变"深度思考搜索"（最多 20 次工具）
-
-    返回（非流式）：
-        message.content        = 普通字符串（**我们现有的解析一行都不用改**）
-        message.annotations    = [{"type": "url_citation", "url_citation": {...}}]
-        message.server_tool_calls = 服务端工具调用记录
-        usage.server_tool_use.tool_search = 联网次数（实测 2 次）
-
-    实测：非思考 + 一次提问 → 3.4 秒，prompt_tokens 2693（搜索把结果拼进了上下文，
-          纯文本只有 600 左右），completion 51。
-
-跑法：`python probes\\probe_web_search.py [问题]`
+跑法：
+    python probes\\probe_web_search.py            # 三句：天气 / 闲聊 / 表情包
+    python probes\\probe_web_search.py 杭州明天天气
 """
 
-import json
 import sys
-import time
-import urllib.request
 
 sys.path.insert(0, __file__.rsplit("\\", 2)[0] or ".")
 
+from wechat_assistant.ai import AIClient
 from wechat_assistant.config import load_config
 
-QUESTION = (sys.argv[1] if len(sys.argv) > 1
-            else "美元兑人民币今天的汇率大概是多少？")
+CASES = ["明天天气怎么样", "你吃了吗", "帮我看看这个表情包啥意思"]
+
+
+class _Cfg:
+    """把真配置包一层，只为在探针里临时打开 `ai.web_search`。"""
+
+    def __init__(self, base):
+        self._base = base
+
+    def get(self, key, default=None):
+        if key == "ai.web_search":
+            return True
+        return self._base.get(key, default)
 
 
 def main() -> int:
     cfg = load_config()
-    base = (cfg.get("ai.base_url") or "").rstrip("/")
-    key = cfg.get("ai.api_key") or ""
-    model = cfg.get("ai.model") or "deepseek-flash"
-    if not base or not key:
+    if not cfg.get("ai.api_key") or not cfg.get("ai.base_url"):
         print("还没配置接口地址 / API Key（去设置里填）")
         return 1
-    print("接口 %s · 模型 %s" % (base, model))
+    c = AIClient(_Cfg(cfg), logger=print)
+    print("接口 %s · 模型 %s · web_search=%s" % (c.base_url, c.model, c.web_search))
 
-    payload = {
-        "model": model,
-        "messages": [{"role": "user", "content": QUESTION}],
-        "tools": [{"type": "deepseek_web_search", "name": "deepseek_web_search"}],
-        "thinking": {"type": "disabled"},
-        "stream": False,
-        "max_tokens": 300,
-    }
-    req = urllib.request.Request(
-        base + "/chat/completions",
-        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        method="POST",
-        headers={"Content-Type": "application/json; charset=utf-8",
-                 "Authorization": "Bearer " + key})
-    t0 = time.time()
-    try:
-        with urllib.request.urlopen(req, timeout=90) as r:
-            data = json.loads(r.read().decode("utf-8"))
-    except Exception as e:
-        body = ""
-        try:
-            body = e.read().decode("utf-8", "ignore")[:600]
-        except Exception:
-            pass
-        print("失败: %s %s %s" % (type(e).__name__, getattr(e, "code", ""), body))
-        return 1
-
-    el = time.time() - t0
-    usage = data.get("usage") or {}
-    stu = usage.get("server_tool_use") or {}
-    msg = ((data.get("choices") or [{}])[0].get("message") or {})
-    print("耗时 %.1fs · 入 %s / 出 %s · 联网 %s 次"
-          % (el, usage.get("prompt_tokens"), usage.get("completion_tokens"),
-             stu.get("tool_search", 0)))
-    print("message 的键:", sorted(msg.keys()))
-    print("回答:", str(msg.get("content"))[:300].replace("\n", " "))
-    ann = msg.get("annotations") or []
-    for a in ann[:3]:
-        cite = (a or {}).get("url_citation") or {}
-        print("引用:", cite.get("title"), cite.get("url"))
+    cases = [sys.argv[1]] if len(sys.argv) > 1 else CASES
+    for cur in cases:
+        q = c.plan_search(cur, "")
+        print("\n【%s】判断 -> %r" % (cur, q))
+        if not q:
+            print("  不用查（这条路走通了：是模型自己判断的）")
+            continue
+        blk = c.fetch_web(q)
+        print("  %d 条 / %d 字 · last_web_calls=%d"
+              % (blk.count("- "), len(blk), c.last_web_calls))
+        for line in blk.splitlines()[1:4]:
+            print("  ", line[:100])
     return 0
 
 
