@@ -180,7 +180,7 @@ class AIClient:
         #:    应该不是在这里吧，是不是要加到读取方式？”）。
         #: 关着的时候**一行代码都不走图**（老行为）。
         self.vision = bool(cfg.get("ocr_read.attach_image", False))
-        #: **联网查证**（2026-11-09 加，默认关）。开着时**由模型决定要不要搜**。
+        #: **联网搜索**（2026-11-09 加，默认关；原叫「联网查证」）。开着时**由模型决定要不要搜**。
         #: ⚠️ 只有 DeepSeek 接口认官方工具；别的接口见 `chat()` 里的 400 回退。
         self.web_search = bool(cfg.get("ai.web_search", False))
         #: 上一次生成**实际联网几次**（`usage.server_tool_use.tool_search`）。
@@ -314,7 +314,7 @@ class AIClient:
                     detail="%s: %s" % (type(e).__name__, e),
                     retriable=retriable) from e
 
-    # ------------------------------------------------------------ 联网查证（两段式）
+    # ------------------------------------------------------------ 联网搜索（两段式）
 
     def plan_search(self, current: str, intent: str = "") -> str:
         """**第 1 段**：让模型判断这句话要不要联网、要查什么。返回查询词（空串 = 不查）。

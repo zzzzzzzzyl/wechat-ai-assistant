@@ -292,12 +292,12 @@ SPEC: List[Setting] = [
     #    SPEC 里的**先后**就是界面上的先后（`settings_ui` 按 SPEC 顺序铺）。
     Setting("ai.n_replies", "ai", "生成几条", "int", default=3, lo=1, hi=8, unit="条",
             level=1),
-    # ⚠️ 2026-11-09：**联网查证**（默认关）。开着时给模型挂服务商的搜索工具，
-    #    **由模型自己判断要不要查**。只在 DeepSeek 接口上用官方工具；
-    #    别的接口报 400 会自动退回不联网（见 `ai.chat`），不会把生成搞挂。
-    Setting("ai.web_search", "ai", "联网查证", "bool", default=False,
+    # ⚠️ 2026-11-09：**联网搜索**（默认关；用户要求这个说法 —— 比"查证"直白）。
+    #    开着时先让模型判断"要不要查、查什么"，再由我们调 Search API 拿结果。
+    #    只在 DeepSeek 接口上做；任何失败都当"没联网"，不会把生成搞挂。
+    Setting("ai.web_search", "ai", "联网搜索", "bool", default=False,
             level=2,
-            help="需要最新消息时让它上网查。会多花几分钱。"),
+            help="需要时上网搜索相关信息"),
     Setting("ocr_read.attach_image", "ai", "识别图片", "bool",
             default=False,
             help="让模型看图，需要支持看图的模型。"),

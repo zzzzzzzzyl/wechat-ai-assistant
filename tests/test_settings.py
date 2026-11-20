@@ -474,6 +474,12 @@ def test_spec(tmp):
     #    SPEC 里的**先后就是界面的先后**（`settings_ui` 按 SPEC 顺序铺），
     #    所以这里比的是**列表下标** —— 光看 group 相同是验不出来的。
     check("「识别图片」的名字是用户要的那个", _att.label == "识别图片", _att.label)
+    # ⚠️ 2026-11-09 用户要求：「联网查证」这个说法改成「**联网搜索**」。
+    #    钉住 label（说法是用户定的），键名 `ai.web_search` **不动**。
+    _ws = SPEC_BY_KEY["ai.web_search"]
+    check("联网那一项叫「联网搜索」", _ws.label == "联网搜索", _ws.label)
+    check("  它还在「AI 接口」组、默认关", _ws.group == "ai" and _ws.default is False,
+          "%s / %r" % (_ws.group, _ws.default))
     _keys = [s.key for s in SPEC if s.group == "ai"]
     check("  （并且排在「视觉模型」**前面**）",
           _keys.index("ocr_read.attach_image") < _keys.index("ai.vision_model"),

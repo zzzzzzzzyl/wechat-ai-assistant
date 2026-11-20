@@ -1389,7 +1389,7 @@ def main():
                 else:
                     log("[KB] 这个会话没开知识库（会话面板里可以打开）")
 
-            # ---- 联网查证（2026-11-09，**两段式**）----------------------------
+            # ---- 联网搜索（2026-11-09，**两段式**）----------------------------
             # ⚠️⚠️ 为什么不在正式生成那次调用里挂服务商工具：实测「写微信回复」的
             #    任务下它**基本不搜**（提示词写"可以"→ 0 次；写"必须"仍 0 次，
             #    还会诱发编造；只有开思考才真搜，但入 11040 token）。
@@ -1406,13 +1406,13 @@ def main():
                         if _web:
                             extra_context = ((extra_context + "\n" + _web)
                                              if extra_context else _web)
-                            log("联网查证:「%s」-> %d 条资料进 prompt"
+                            log("联网搜索:「%s」-> %d 条资料进 prompt"
                                 % (_q[:30], _web.count("- ")))
                         else:
-                            log("联网查证:「%s」没查到东西，这次不带资料" % _q[:30])
+                            log("联网搜索:「%s」没查到东西，这次不带资料" % _q[:30])
                 except Exception as e:
                     # 可选功能，失败绝不影响生成
-                    log("联网查证失败（这次不联网）: %s: %s" % (type(e).__name__, e))
+                    log("联网搜索失败（这次不联网）: %s: %s" % (type(e).__name__, e))
             try:
                 # ⚠️ 图片只有 `ocr_read.attach_image` 打开时才会有
                 #    （见 `OcrReader._crop_images` / `reader._crop_images_from_window`）；
