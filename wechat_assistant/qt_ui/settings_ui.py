@@ -1560,9 +1560,11 @@ class SettingsWindow(QtCore.QObject):
             if i < len(items) - 1:
                 self.scroll.add(hline(st))
 
-        # 「基础设置」组：级别选择器下面接一段**新手指引**
+        # 「基础设置」组：级别选择器下面接**检查更新** + 一段**新手指引**
         # （用户要求「新手可以添加指引」——新手缺的不是开关，是"先做哪一步"）。
         if self._group == "base":
+            self.scroll.add(hline(st))
+            self.scroll.add(self._build_updater())
             self.scroll.add(hline(st))
             self.scroll.add(self._build_level_guide())
 
@@ -1578,6 +1580,155 @@ class SettingsWindow(QtCore.QObject):
         if self._group == "ui":
             self.scroll.add(hline(st))
             self.scroll.add(self._build_autostart())
+
+    # ------------------------------------------------------------ 检查更新
+
+    def _build_updater(self):
+        """「基础设置」里的**检查更新**（2026-11-09 用户要求）。
+
+        ⚠️ 它**不是 SPEC 的项**（objectName=`updater`）：一个按钮 + 一行当前版本，
+           跟 `kb-files` / `level-guide` 一样在测试里被跳过。
+        ⚠️ 打包版才做真正的"下载并重启"；源码版只检查并提示去 releases 页
+           —— 覆盖源码目录毫无意义，还会把用户的 git 工作区搞脏。
+        """
+        from .. import __version__
+
+        st = self.style
+        box = QtWidgets.QWidget(self.scroll.inner)
+        box.setObjectName("updater")
+        lay = QtWidgets.QVBoxLayout(box)
+        lay.setContentsMargins(st.S("xl"), st.S("md"), st.S("xl"), st.S("md"))
+        lay.setSpacing(st.S("xs"))
+
+        row = QtWidgets.QHBoxLayout()
+        row.setSpacing(st.S("md"))
+        row.addWidget(label(st, "检查更新", font_name="body", color_key="text"))
+        row.addWidget(label(st, "当前 %s" % __version__, font_name="small",
+                            color_key="text_dim"))
+        row.addStretch(1)
+        btn = Pill(st, "检查更新", variant="ghost", parent=box)
+        btn.clicked.connect(self._on_check_update)
+        row.addWidget(btn)
+        lay.addLayout(row)
+        lay.addWidget(label(
+            st, "有新版本会下载并自动重启；你的设置和聊天记录不会被覆盖。",
+            font_name="small", color_key="text_dim", wrap=True))
+        return box
+
+    def _on_check_update(self):
+        """点「检查更新」：网络在**子线程**里跑，回 UI 线程弹结果。"""
+        import threading
+
+        self._say("正在检查更新…")
+        threading.Thread(target=self._check_update_worker, daemon=True).start()
+
+    def _check_update_worker(self):
+        from .. import updater
+
+        try:
+            info = updater.latest()
+            res = {"ok": True, "info": info}
+        except Exception as e:
+            res = {"ok": False, "err": "%s: %s" % (type(e).__name__, e)}
+        # ⚠️ 子线程**绝不能碰控件**：走队列回到 UI 线程（项目铁律）。
+        try:
+            QtCore.QMetaObject.invokeMethod(
+                self, "_on_update_checked", QtCore.Qt.QueuedConnection,
+                QtCore.Q_ARG(object, res))
+        except Exception as e:
+            self._log("回传更新结果失败: %s: %s" % (type(e).__name__, e))
+
+    @QtCore.Slot(object)
+    def _on_update_checked(self, res):
+        """检查结果回来了：没有新版就直说，有就确认后下载。"""
+        from .. import __version__
+        from .. import updater
+
+        if not res.get("ok"):
+            self._say("检查更新失败", ok=False)
+            _error(self.win, "检查更新",
+                   "连不上更新服务器。\n\n%s\n\n"
+                   "可以稍后再试，或自己去下载页看看。\n%s"
+                   % (res.get("err", ""), updater.RELEASES_PAGE), style=self.style)
+            return
+
+        info = res.get("info") or {}
+        remote = info.get("version") or ""
+        if not updater.is_newer(remote, __version__):
+            self._say("已经是最新版")
+            _error(self.win, "检查更新",
+                   "已经是最新版（%s）。" % __version__, style=self.style)
+            return
+
+        if not updater.is_frozen():
+            self._say("有新版本 %s" % remote)
+            _error(self.win, "发现新版本",
+                   "最新是 %s，你现在跑的是**源码**（%s）。\n\n"
+                   "源码更新请自己 git pull；要让「自动更新」生效，请用打包版。\n%s"
+                   % (remote, __version__, updater.RELEASES_PAGE), style=self.style)
+            return
+
+        ok = _ask_yes_no(
+            self.win, "发现新版本",
+            "最新是 %s（你现在 %s）。\n\n现在下载并重启更新吗？"
+            "\n下载约 %d MB，装完会自动重启，你的设置和聊天记录不会丢。"
+            % (remote, __version__, max(1, int(info.get("size") or 0) // 1048576)),
+            yes="现在更新", no="以后再说", style=self.style)
+        if not ok:
+            self._say("以后再说")
+            return
+        self._say("开始下载…")
+        import threading
+
+        threading.Thread(target=self._download_worker, args=(info,),
+                         daemon=True).start()
+
+    def _download_worker(self, info):
+        from .. import updater
+
+        try:
+            wd = updater.work_dir()
+            zip_path = os.path.join(wd, "update.zip")
+            updater.download(info["url"], zip_path)
+            app_dir = updater.extract(zip_path, os.path.join(wd, "stage"))
+            got = updater.staged_version(app_dir)
+            if not updater.is_newer(got, "") and got != info.get("version"):
+                raise RuntimeError("新包版本对不上（%s ≠ %s）"
+                                   % (got, info.get("version")))
+            res = {"ok": True, "app_dir": app_dir, "version": got}
+        except Exception as e:
+            res = {"ok": False, "err": "%s: %s" % (type(e).__name__, e)}
+        try:
+            QtCore.QMetaObject.invokeMethod(
+                self, "_on_update_ready", QtCore.Qt.QueuedConnection,
+                QtCore.Q_ARG(object, res))
+        except Exception:
+            pass
+
+    @QtCore.Slot(object)
+    def _on_update_ready(self, res):
+        from .. import updater
+
+        if not res.get("ok"):
+            self._say("更新失败", ok=False)
+            _error(self.win, "更新失败",
+                   "下载或校验没通过，这次先不更新（旧版本还能用）。\n\n%s\n\n"
+                   "也可以自己去下载页：\n%s"
+                   % (res.get("err", ""), updater.RELEASES_PAGE), style=self.style)
+            return
+        try:
+            exe_path = os.path.join(updater.install_dir(), updater.EXE_NAME)
+            updater.spawn_apply(os.getpid(), res["app_dir"],
+                                updater.install_dir(), exe_path)
+        except Exception as e:
+            self._say("更新失败", ok=False)
+            _error(self.win, "更新失败",
+                   "没法启动更新程序（可能权限不够）。\n\n%s: %s"
+                   % (type(e).__name__, e), style=self.style)
+            return
+        self._say("正在重启…")
+        # ⚠️ 这里**必须真的退出**：后台脚本要等到本进程结束才会覆盖文件。
+        QtWidgets.QApplication.instance().quit()
 
     # ------------------------------------------------------------ 开机自启
 

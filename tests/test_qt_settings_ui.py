@@ -1224,8 +1224,11 @@ def test_both_themes(app, tmp):
                 # ⚠️ 2026-11-08：「基础设置」下面同样挂了一块新手引导
                 #    （`_build_level_guide`，objectName="level-guide"），同一个理由跳过。
                 # ⚠️ 2026-11-09：「外观」组末尾挂了「开机自启」一行
-                #    （`_build_autostart`，objectName="autostart"）—— 同样不是 SPEC 的项。
-                if w.objectName() in ("kb-files", "level-guide", "autostart"):
+                #    （`_build_autostart`，objectName="autostart"）、
+                #    「基础设置」里挂了「检查更新」（`_build_updater`，objectName="updater"）
+                #    —— 都不是 SPEC 的项，按 objectName 跳过。
+                if w.objectName() in ("kb-files", "level-guide", "autostart",
+                                      "updater"):
                     continue
                 k = keys[ri] if ri < len(keys) else "?"
                 ri += 1
@@ -2362,6 +2365,36 @@ def test_drag_offscreen(app, tmp):
         safe(win.close)
 
 
+def test_updater_row(app, tmp):
+    """「基础设置」里的**检查更新**（2026-11-09 用户要求）。
+
+    ⚠️ **不联网**：只验界面长出来了 + 版本号显示对；真查更新见 `test_updater.py`
+       和手工验收（点一次会真的打 GitHub API）。
+    """
+    print("\n14f. 基础设置里的检查更新（不联网）")
+    from PySide6 import QtWidgets
+
+    from wechat_assistant import __version__
+
+    win, _store, _style = make_win(tmp, level="novice")
+    try:
+        win.open("base")
+        pump(app, 250)
+        boxes = [w for w in win.win.findChildren(QtWidgets.QWidget)
+                 if w.objectName() == "updater"]
+        check("基础设置里有「检查更新」这一块", len(boxes) == 1, str(len(boxes)))
+        texts = [w.text() for w in labels_of(win.win)]
+        check("标题就是「检查更新」", "检查更新" in texts,
+              str([t for t in texts if "更新" in t][:3]))
+        check("显示了当前版本号", any(__version__ in t for t in texts),
+              str([t for t in texts if __version__ in t][:2]))
+        check("说明里讲清了「设置和记录不会被覆盖」",
+              any("不会被覆盖" in t for t in texts),
+              str([t for t in texts if "覆盖" in t][:2]))
+    finally:
+        safe(win.close)
+
+
 def test_autostart_switch(app, tmp):
     """「外观」组里的**开机自启**开关（2026-11-09 用户要求）。
 
@@ -2484,6 +2517,7 @@ def main():
         test_levels(app, tmp)
         test_drag_offscreen(app, tmp)
         test_autostart_switch(app, tmp)
+        test_updater_row(app, tmp)
         test_no_tk_leftovers()
 
         print("\n15. 没有污染仓库")

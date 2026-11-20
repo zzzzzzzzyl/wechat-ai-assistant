@@ -388,7 +388,33 @@ def main():
                     help="（已默认生效，保留仅为兼容旧命令）")
     ap.add_argument("--allow-multi", action="store_true",
                     help="允许多开（默认第二个实例会把已开的那个唤到前面并退出）")
+    # ⚠️ 2026-11-09：给**自动更新**用 —— 更新器解压出新版本后，先跑一次
+    #    `新exe --version` 核对版本，确认无误才覆盖安装目录（见 `updater.py`）。
+    #    ⚠️ 必须**抢在单实例检查之前**返回：否则它会去唤旧版本然后退出 0，
+    #    更新器会误以为"新版本正常"。
+    ap.add_argument("--version", action="store_true",
+                    help="打印版本号后退出（自动更新用它核对新包）")
+    # ⚠️⚠️ 2026-11-09：**必须**能写文件 —— 打包版是 `console=False`，
+    #    `sys.stdout` 是 None，`print()` 会抛异常（PyInstaller 在窗口模式下弹一个
+    #    崩溃对话框然后**挂住**：实测 `exe --version` 挂了 5 分钟，我还得手动 kill）。
+    #    所以更新器核查新包时，走 `--version --version-out <临时文件>`。
+    ap.add_argument("--version-out", default="", help=argparse.SUPPRESS)
     args = ap.parse_args()
+
+    if args.version:
+        from wechat_assistant import __version__
+
+        try:
+            if args.version_out:
+                with open(args.version_out, "w", encoding="utf-8") as f:
+                    f.write(__version__)
+        except Exception:
+            pass
+        try:
+            print(__version__)
+        except Exception:
+            pass          # 无控制台时不打（见上面的说明）
+        return 0
 
     log = make_logger(quiet=args.quiet)
 

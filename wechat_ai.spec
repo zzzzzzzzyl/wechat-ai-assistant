@@ -111,6 +111,10 @@ hiddenimports = [
     #    静态分析可能看不全。漏掉的症状：**打包版点「开机自启」开关才报
     #    ImportError**，而源码版一切正常；又因为它在该页最下面，很容易漏测。
     "wechat_assistant.autostart",
+    # ⚠️ 2026-11-09：检查更新/自动更新也是**函数内懒加载**
+    #    （`settings_ui._check_update_worker` 里 `from .. import updater`）。
+    #    漏掉的症状：**打包版点「检查更新」才报 ImportError**（和 autostart 同一个坑）。
+    "wechat_assistant.updater",
     # ⚠️ 2026-10-17：知识库是**懒加载**的（`run_watch.main` 里 `if kb.enabled` 才 import，
     #    `settings_ui._kb()` 里也是函数内 import）—— 静态分析可能看不全。
     #    漏掉的症状：**打包版一打开知识库分组就报错 / 生成时静默没有参考资料**。
