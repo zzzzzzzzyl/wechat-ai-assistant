@@ -1598,6 +1598,63 @@ class SettingsWindow(QtCore.QObject):
 
     # ------------------------------------------------------------ 检查更新
 
+    def _custom_row(self, title, tip, control, oname, right_text=""):
+        """画一行**不在 SPEC 里**的设置行，垂直节奏跟 `_build_row` 完全一致。
+
+        ⚠️ 2026-11-09 用户报「有些行高不一致」：原来「检查更新」和「开机自启」
+           是手写的两个横排（68 / 60 高），而普通行是
+           「标题 34 → 控件 34 → 说明 28」= 110。混在一起就是"一行高一行矮"。
+           统一走这里之后，三块都是同一个节奏。
+        ⚠️ `control` 是已经建好的控件（Pill / Switch），这里只负责**摆位置**：
+           放进 34 高的槽里、**垂直居中、靠左**（跟普通行的输入框同一列）。
+        """
+        st = self.style
+        box = QtWidgets.QWidget(self.scroll.inner)
+        box.setObjectName(oname)
+        lay = QtWidgets.QVBoxLayout(box)
+        lay.setContentsMargins(st.S("xl"), st.S("md"), st.S("xl"), st.S("xs"))
+        lay.setSpacing(0)
+
+        head = QtWidgets.QHBoxLayout()
+        head.setContentsMargins(0, 0, 0, 0)
+        head.setSpacing(st.S("sm"))
+        head.addWidget(label(st, title, font_name="body", color_key="text"),
+                       0, QtCore.Qt.AlignVCenter)
+        head.addStretch(1)
+        if right_text:
+            head.addWidget(label(st, right_text, font_name="small",
+                                 color_key="text_faint"), 0,
+                           QtCore.Qt.AlignVCenter)
+        headw = QtWidgets.QWidget(box)
+        headw.setFixedHeight(st.px(ROW_HEAD_H))
+        headw.setLayout(head)
+        lay.addWidget(headw)
+
+        lay.addSpacing(st.S("xs"))
+        holder = QtWidgets.QWidget(box)
+        hlay = QtWidgets.QVBoxLayout(holder)
+        hlay.setContentsMargins(0, 0, 0, 0)
+        hlay.setSpacing(0)
+        hlay.setAlignment(QtCore.Qt.AlignVCenter)
+        hlay.addWidget(control, 0)
+        holder.setFixedHeight(st.px(ROW_CTRL_H))
+        lay.addWidget(holder)
+
+        if tip:
+            lay.addSpacing(st.S("xxs"))
+            self._tips.add(box, tip)
+            lab = self._tips.labels[-1]
+            lay.addWidget(lab, 0)
+        else:
+            lay.addSpacing(st.S("xxs"))
+            lab = QtWidgets.QLabel("")
+            lab.setFont(st.font("small"))
+            lay.addWidget(lab, 0)
+        # ⚠️ 说明**必须和普通行一样占 `ROW_TIP_LINES` 行高** —— 少了这一步，
+        #    这两块就比别人矮 14 设备像素（用户报的"行高不一致"就是这个）。
+        lab.setFixedHeight(self._tip_line_h() * ROW_TIP_LINES)
+        return box
+
     def _build_updater(self):
         """「基础设置」里的**检查更新**（2026-11-09 用户要求）。
 
@@ -1605,30 +1662,16 @@ class SettingsWindow(QtCore.QObject):
            跟 `kb-files` / `level-guide` 一样在测试里被跳过。
         ⚠️ 打包版才做真正的"下载并重启"；源码版只检查并提示去 releases 页
            —— 覆盖源码目录毫无意义，还会把用户的 git 工作区搞脏。
+        ⚠️ 布局走 `_custom_row`（和普通行同高），见那里的说明。
         """
         from .. import __version__
 
-        st = self.style
-        box = QtWidgets.QWidget(self.scroll.inner)
-        box.setObjectName("updater")
-        lay = QtWidgets.QVBoxLayout(box)
-        lay.setContentsMargins(st.S("xl"), st.S("md"), st.S("xl"), st.S("md"))
-        lay.setSpacing(st.S("xs"))
-
-        row = QtWidgets.QHBoxLayout()
-        row.setSpacing(st.S("md"))
-        row.addWidget(label(st, "检查更新", font_name="body", color_key="text"))
-        row.addWidget(label(st, "当前 %s" % __version__, font_name="small",
-                            color_key="text_dim"))
-        row.addStretch(1)
-        btn = Pill(st, "检查更新", variant="ghost", parent=box)
+        btn = Pill(self.style, "检查更新", variant="ghost")
         btn.clicked.connect(self._on_check_update)
-        row.addWidget(btn)
-        lay.addLayout(row)
-        lay.addWidget(label(
-            st, "有新版本会下载并自动重启；你的设置和聊天记录不会被覆盖。",
-            font_name="small", color_key="text_dim", wrap=True))
-        return box
+        return self._custom_row(
+            "检查更新",
+            "有新版本会下载并自动重启；设置和聊天记录不会被覆盖。",
+            btn, oname="updater", right_text="当前 %s" % __version__)
 
     def _on_check_update(self):
         """点「检查更新」：网络在**子线程**里跑，回 UI 线程弹结果。"""
@@ -1769,31 +1812,18 @@ class SettingsWindow(QtCore.QObject):
            测试里按 `objectName` 跳过）：它读写的不是配置，而是注册表启动项。
         ⚠️ 值**每次进页面都重新读**（`autostart.state()`），不回写 store ——
            否则界面会替系统"记着"一个已经不存在的状态。
+        ⚠️⚠️ 2026-11-09 用户报「有些行高不一致」：这一块原来是"标题 + 开关"
+           横着放（总高 60），而普通行是「标题 34 → 控件 34 → 说明 28」= 110。
+           现在**照抄普通行的垂直节奏**（`_custom_row`），所以高度和别的行一样。
         """
         from .. import autostart
 
-        st = self.style
-        box = QtWidgets.QWidget(self.scroll.inner)
-        box.setObjectName("autostart")
-        lay = QtWidgets.QVBoxLayout(box)
-        lay.setContentsMargins(st.S("xl"), st.S("md"), st.S("xl"), st.S("lg"))
-        lay.setSpacing(st.S("xs"))
-
         on, _cmd = autostart.state()
-        row = QtWidgets.QHBoxLayout()
-        row.setSpacing(st.S("md"))
-        row.addWidget(label(st, "开机自启", font_name="body", color_key="text"))
-        row.addStretch(1)
-        row.addWidget(Switch(st, on, parent=box, command=self._on_autostart))
-        lay.addLayout(row)
-
-        # ⚠️ 文案里**不写注册表路径、不写 exe 文件名**（设置界面是给用户看的）。
-        tip = "登录 Windows 后自动启动。微信开着就能用，不用每次手动点。"
+        tip = "登录后自动启动，微信开着就能用。"
         if on and autostart.is_stale():
             tip = "启动项还指着旧位置，拨一下开关重新记一遍。"
-        lay.addWidget(label(st, tip, font_name="small",
-                            color_key="text_dim", wrap=True))
-        return box
+        sw = Switch(self.style, on, parent=None, command=self._on_autostart)
+        return self._custom_row("开机自启", tip, sw, oname="autostart")
 
     def _on_autostart(self, value):
         """拨开关：写/删注册表启动项。失败就**重建这一页**（开关回到真实状态）。"""
