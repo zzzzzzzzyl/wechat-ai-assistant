@@ -297,14 +297,14 @@ SPEC: List[Setting] = [
     #    只在 DeepSeek 接口上做；任何失败都当"没联网"，不会把生成搞挂。
     Setting("ai.web_search", "ai", "联网搜索", "bool", default=False,
             level=2,
-            help="需要时上网搜索相关信息"),
+            help="需要时上网搜索相关信息，目前支持deepseek tool-search"),
     Setting("ocr_read.attach_image", "ai", "识别图片", "bool",
             default=False,
             help="让模型看图，需要支持看图的模型。"),
     # ⚠️ 2026-11-09：图片原来**只有长边上限**（1024），没有张数/体积上限 ——
     #    视觉模型按图算 token，一屏 4 张能把输入从 821 顶到 4000+。
     Setting("ocr_read.max_images", "ai", "最多几张图", "int", default=3, lo=1, hi=10,
-            unit="张", level=2,
+            unit="张", level=3,
             help="多了只发最近的几张。"),
     Setting("ai.vision_model", "ai", "视觉模型", "text", default="",
             help="留空 = 用上面的模型。"),
@@ -351,7 +351,8 @@ SPEC: List[Setting] = [
             help="贴边 = 站在微信旁边；固定悬浮 = 记住你拖的位置。",
             level=1),
     Setting("ui.dock_side", "ui", "贴哪边", "choice", default="auto",
-            choices=[("auto", "自动（右→左→角落）"), ("right", "固定右侧"), ("left", "固定左侧")]),
+            choices=[("auto", "自动（右→左→角落）"), ("right", "固定右侧"), ("left", "固定左侧")],
+            level=3),
     Setting("ui.follow_minimize", "ui", "最小化时一起收起", "bool", default=True),
     # ⚠️⚠️ 2026-10-13 **删掉「面板宽度」这一项**（用户提的）。
     #    它本来就在面板上直接调：拖**左/右边缘**改宽度，松手就
@@ -362,10 +363,11 @@ SPEC: List[Setting] = [
     #       `SettingsStore.set()` 不校验 SPEC，所以拖动保存这条路不受影响。
     #    范围由下面两项限定：`ui.min_width` / `ui.width_max`。
     Setting("ui.height", "ui", "面板高度", "int", default=0, lo=0, hi=2000, unit="px",
-            help="0 = 跟着微信的高度。"),
-    Setting("ui.opacity", "ui", "不透明度", "float", default=1.0, lo=0.5, hi=1.0),
+            help="0 = 跟着微信的高度。", level=3),
+    Setting("ui.opacity", "ui", "不透明度", "float", default=1.0, lo=0.5, hi=1.0,
+            level=3),
     Setting("ui.topmost", "ui", "总是置顶", "bool", default=False,
-            help="只在「固定悬浮」下有用。"),
+            help="只在「固定悬浮」下有用。", level=3),
 
     # ---- 行为 ----
     # ⚠️ 2026-10-13 这一组从 9 项砍到 2 项（用户要求「方便用户操作」）。
@@ -417,7 +419,7 @@ SPEC: List[Setting] = [
     #    ⚠️ 它的 help 原来写着"建议一直关着"，挪过来之后那句话和位置自相矛盾，
     #    改成把**两种行为**讲清楚；默认仍然是关。
     Setting("reply.use_cursor_anchor", "behavior", "用鼠标定位回复目标", "bool",
-            default=False,
+            default=False, level=3,
             help="把鼠标停着的那条当回复目标。"),
 
     # ---- 会话与记录 ----
