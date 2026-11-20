@@ -1625,8 +1625,15 @@ class SettingsWindow(QtCore.QObject):
     def _check_update_worker(self):
         from .. import updater
 
+        # ⚠️ 2026-11-09：**查版本也走加速**（用户追问「检查更新是不是没有加速」）。
+        #    `update.mirror` 填了就排第一；留空 = 按 `LATEST_SOURCES` 依次试。
+        _custom = ""
         try:
-            info = updater.latest()
+            _custom = self.store.get("update.mirror", "") or ""
+        except Exception:
+            pass
+        try:
+            info = updater.latest(mirror=_custom)
             res = {"ok": True, "info": info}
         except Exception as e:
             res = {"ok": False, "err": "%s: %s" % (type(e).__name__, e)}

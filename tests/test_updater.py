@@ -236,6 +236,63 @@ def test_latest_redirect():
         urllib.request.urlopen = real
 
 
+def test_latest_sources():
+    """查版本的多源兜底（2026-11-09 用户追问「检查更新是不是没有加速」）。
+
+    ⚠️ 不联网：打桩 `_latest_api` / `_latest_redirect`，只验**顺序**和**回退**。
+    """
+    from wechat_assistant import updater
+
+    print("\n7. 查版本也走多源（先直连、再能代理 API 的镜像、最后跳转）")
+    s = updater.latest_sources()
+    check("第一个是直连 API", s[0] == ("", "api"), str(s[:2]))
+    check("第二个是能代理 API 的 gh-proxy.com",
+          s[1] == ("https://gh-proxy.com/", "api"), str(s[1]))
+    check("至少有一条跳转兜底", any(k == "redirect" for _p, k in s), str(s))
+    check("ghfast.top **不**在查版本的表里（它查版本会断）",
+          all("ghfast" not in p for p, _k in s), str(s))
+    check("自定义镜像排最前（且按 api 方式）",
+          updater.latest_sources("https://my.m")[0] == ("https://my.m/", "api"),
+          str(updater.latest_sources("https://my.m")[:1]))
+
+    calls = []
+
+    def fake_api(timeout, prefix=""):
+        calls.append(("api", prefix))
+        raise RuntimeError("boom")
+
+    def fake_red(timeout, prefix=""):
+        calls.append(("redirect", prefix))
+        if "ghproxy.net" in prefix:
+            return {"version": "9.9.9", "tag": "v9.9.9", "url": "u",
+                    "size": 0, "published": ""}
+        raise RuntimeError("boom")
+
+    real_api, real_red = updater._latest_api, updater._latest_redirect
+    updater._latest_api, updater._latest_redirect = fake_api, fake_red
+    try:
+        info = updater.latest()
+        check("前面全挂也能在最后一个源拿到版本", info["version"] == "9.9.9", str(info))
+        check("确实按顺序试了（直连 -> gh-proxy -> 跳转）",
+              calls[0] == ("api", "") and calls[1][0] == "api"
+              and calls[-1][1].startswith("https://ghproxy.net"),
+              str(calls))
+
+        def all_fail(timeout, prefix=""):
+            raise RuntimeError("boom")
+
+        updater._latest_api = all_fail
+        updater._latest_redirect = all_fail
+        try:
+            updater.latest()
+            err = ""
+        except Exception as e:
+            err = str(e)
+        check("全失败时抛错且说清「所有更新源都查不到」", "所有更新源" in err, err)
+    finally:
+        updater._latest_api, updater._latest_redirect = real_api, real_red
+
+
 def main():
     print("=" * 70)
     print("检查更新 / 自动更新测试")
@@ -246,6 +303,7 @@ def main():
     test_install_dir()
     test_mirrors()
     test_latest_redirect()
+    test_latest_sources()
     print("\n" + "=" * 70)
     print("通过 %d，失败 %d" % (PASS, FAIL))
     print("=" * 70)

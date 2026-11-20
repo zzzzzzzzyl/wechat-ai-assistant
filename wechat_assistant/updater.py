@@ -82,24 +82,64 @@ def is_newer(remote: str, local: str) -> bool:
     return r + (0,) * (n - len(r)) > l + (0,) * (n - len(l))
 
 
-def latest(timeout: float = API_TIMEOUT) -> dict:
-    """查最新 Release。返回 dict；查不到**抛异常**（调用方要能说清原因）。
+#: 查版本时的**多源兜底**（2026-11-09 用户追问「检查更新是不是没有加速」——原来确实没有）。
+#:
+#: 每项是 `(前缀, 方式)`：`api` = 调 `api.github.com`；`redirect` = 读
+#: `github.com/<repo>/releases/latest` 的跳转。前缀加在地址前面（镜像）。
+#:
+#: ⚠️ 实测（本机，Python urllib 口径，2026-11-09）：
+#:    · 直连 API 1.3s ✓；`gh-proxy.com` 代理 API 1.1s ✓（**最快**，且能拿到 size）；
+#:    · 直连跳转 1.9s ✓；`ghproxy.net` 代理跳转 2.4s ✓；
+#:    · `ghfast.top` 只有**下载**能用，查版本会 "Remote end closed" ✗
+#:      （curl 能过、urllib 不行 —— 所以它只留在下载镜像里，不进这张表）；
+#:    · `gh-proxy.com` 代理**跳转**拿不到 tag（它不重定向）✗。
+#:    顺序就是按这张表排的。
+LATEST_SOURCES = [
+    ("", "api"),
+    ("https://gh-proxy.com/", "api"),
+    ("", "redirect"),
+    ("https://ghproxy.net/", "redirect"),
+]
+
+
+def latest_sources(custom: str = "") -> list:
+    """查版本的源顺序（`custom` 非空就排最前面）。"""
+    out = list(LATEST_SOURCES)
+    c = (custom or "").strip()
+    if c:
+        if not c.endswith("/"):
+            c += "/"
+        out.insert(0, (c, "api"))
+    return out
+
+
+def latest(timeout: float = API_TIMEOUT, mirror: str = "") -> dict:
+    """查最新 Release（**多源依次试**）。返回 dict；全失败才抛异常。
 
     字段：`version`（tag 去掉 v）、`tag`、`url`（zip 下载地址）、`size`、`published`。
 
-    ⚠️ 先走 API；**API 不通就退回"读 releases/latest 的跳转地址"**
-       —— 国内 api.github.com 偶尔会被 reset，但 github.com 的跳转通常还能通。
-       退回时 `size` 拿不到（填 0），下载也没问题。
+    ⚠️ 每个源给 `timeout` 秒；一个不行就换下一个 —— 顺序见 `LATEST_SOURCES`。
+       `gh-proxy.com` 那条能代理 API（拿到完整信息、含 size）；
+       跳转那几条拿不到 `size`（填 0），下载照样能下。
     """
-    try:
-        return _latest_api(timeout)
-    except Exception as e:
-        _log_note("API 查不到（%s），改用 releases/latest 跳转" % str(e)[:60])
-        return _latest_redirect(timeout)
+    errs = []
+    for prefix, kind in latest_sources(mirror):
+        try:
+            if kind == "api":
+                info = _latest_api(timeout, prefix=prefix)
+            else:
+                info = _latest_redirect(timeout, prefix=prefix)
+            if prefix:
+                _log_note("查版本走的镜像：%s（%s）" % (prefix, kind))
+            return info
+        except Exception as e:
+            errs.append("%s%s: %s" % (prefix or "直连", kind, str(e)[:60]))
+            _log_note("这个源查不到，换下一个：%s" % errs[-1])
+    raise RuntimeError("所有更新源都查不到：" + " | ".join(errs[-2:]))
 
 
-def _latest_api(timeout: float) -> dict:
-    req = urllib.request.Request(API_URL, headers={
+def _latest_api(timeout: float, prefix: str = "") -> dict:
+    req = urllib.request.Request(prefix + API_URL, headers={
         "User-Agent": "wechat-ai-assistant-updater",
         "Accept": "application/vnd.github+json",
     })
@@ -122,13 +162,15 @@ def _latest_api(timeout: float) -> dict:
     }
 
 
-def _latest_redirect(timeout: float) -> dict:
+def _latest_redirect(timeout: float, prefix: str = "") -> dict:
     """不调 API，用 `github.com/<repo>/releases/latest` 的 **302 跳转**拿 tag。
 
     ⚠️ 资产名是**约定**的（`wechat-ai-assistant-win64.zip`，见 `ZIP_NAME`），
        所以能直接拼出下载地址 —— 这也是为什么发布时那个名字不能改。
+    ⚠️ 走镜像时最终 URL 会带前缀（`https://ghfast.top/https://github.com/.../tag/v0.2.2`），
+       取**最后一段**照样是 tag —— 所以前缀在开头不影响解析。
     """
-    url = "https://github.com/%s/releases/latest" % REPO
+    url = prefix + "https://github.com/%s/releases/latest" % REPO
     req = urllib.request.Request(url, headers={
         "User-Agent": "wechat-ai-assistant-updater"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
