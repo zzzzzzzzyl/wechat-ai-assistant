@@ -1689,7 +1689,16 @@ class SettingsWindow(QtCore.QObject):
         try:
             wd = updater.work_dir()
             zip_path = os.path.join(wd, "update.zip")
-            updater.download(info["url"], zip_path)
+            # ⚠️ 2026-11-09：**下载带镜像回退**（用户问「是否有用 github 加速」——
+            #    实测直连 0.23MB/s、ghfast.top 0.69MB/s，128MB 差 6 分钟）。
+            #    `update.mirror` 填了就排第一个；留空 = 全自动。
+            _custom = ""
+            try:
+                _custom = self.store.get("update.mirror", "") or ""
+            except Exception:
+                pass
+            updater.download(info["url"], zip_path,
+                             mirrors=updater.default_mirrors(_custom))
             app_dir = updater.extract(zip_path, os.path.join(wd, "stage"))
             got = updater.staged_version(app_dir)
             if not updater.is_newer(got, "") and got != info.get("version"):

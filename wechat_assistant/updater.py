@@ -39,9 +39,25 @@ RELEASES_PAGE = "https://github.com/%s/releases" % REPO
 #: 打包产物里 exe 的文件名（`packaging/make_zip.py` 用的也是它）。
 EXE_NAME = "微信AI助手.exe"
 
+#: Release 里那个 zip 资产的**约定名**。
+#:
+#: ⚠️ 它就是 `packaging/make_zip.py` 提示"上传时改成这个名字"的那个名字。
+#:    改这里的唯一理由：发布时资产名也一起改 —— 否则 `_latest_redirect()`
+#:    拼出来的下载地址会 404（API 那条路不受影响，因为 API 直接给地址）。
+ZIP_NAME = "wechat-ai-assistant-win64.zip"
+
 #: 下载/查询的超时（秒）。查询要短，下载要长（128MB）。
 API_TIMEOUT = 10
 DOWNLOAD_TIMEOUT = 60
+
+#: 速度闸：开了 `STALL_AFTER_S` 秒之后，平均速度还低于 `STALL_MIN_BYTES_PER_S`
+#: 就掐掉换下一个源。
+#:
+#: ⚠️ 为什么要有它：直连 GitHub 实测 0.23 MB/s，128MB 要 9 分钟；
+#:    而一条"几乎不动"的进度条用户只会以为卡死了。宁可换镜像重下。
+#: ⚠️ 200KB/s 是宽松值（ghfast.top 实测 0.69MB/s 能过、ghproxy.net 0.03MB/s 会被掐）。
+STALL_AFTER_S = 8.0
+STALL_MIN_BYTES_PER_S = 200 * 1024
 
 
 def parse_version(text: str):
@@ -70,7 +86,19 @@ def latest(timeout: float = API_TIMEOUT) -> dict:
     """查最新 Release。返回 dict；查不到**抛异常**（调用方要能说清原因）。
 
     字段：`version`（tag 去掉 v）、`tag`、`url`（zip 下载地址）、`size`、`published`。
+
+    ⚠️ 先走 API；**API 不通就退回"读 releases/latest 的跳转地址"**
+       —— 国内 api.github.com 偶尔会被 reset，但 github.com 的跳转通常还能通。
+       退回时 `size` 拿不到（填 0），下载也没问题。
     """
+    try:
+        return _latest_api(timeout)
+    except Exception as e:
+        _log_note("API 查不到（%s），改用 releases/latest 跳转" % str(e)[:60])
+        return _latest_redirect(timeout)
+
+
+def _latest_api(timeout: float) -> dict:
     req = urllib.request.Request(API_URL, headers={
         "User-Agent": "wechat-ai-assistant-updater",
         "Accept": "application/vnd.github+json",
@@ -94,20 +122,113 @@ def latest(timeout: float = API_TIMEOUT) -> dict:
     }
 
 
-def download(url: str, dest: str, on_progress=None,
-             timeout: float = DOWNLOAD_TIMEOUT) -> str:
-    """下载到 `dest`；每下 512KB 回调一次 `on_progress(got, total)`。返回 dest。"""
+def _latest_redirect(timeout: float) -> dict:
+    """不调 API，用 `github.com/<repo>/releases/latest` 的 **302 跳转**拿 tag。
 
-    def _hook(blocks, block_size, total):
-        if on_progress:
-            try:
-                on_progress(min(blocks * block_size, total or 0), total or 0)
-            except Exception:
-                pass
+    ⚠️ 资产名是**约定**的（`wechat-ai-assistant-win64.zip`，见 `ZIP_NAME`），
+       所以能直接拼出下载地址 —— 这也是为什么发布时那个名字不能改。
+    """
+    url = "https://github.com/%s/releases/latest" % REPO
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "wechat-ai-assistant-updater"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        final = r.geturl() or ""
+    # ⚠️ 必须**看到 `/releases/tag/`** 才认 —— 否则（比如被重定向到 releases 首页、
+    #    或者被运营商劫持到一个普通页面）会把路径最后一段当版本号，那是瞎猜。
+    if "/releases/tag/" not in final:
+        raise RuntimeError("拿不到最新版本号")
+    tag = final.rstrip("/").rsplit("/", 1)[-1]
+    if not tag or tag == "latest":
+        raise RuntimeError("拿不到最新版本号")
+    return {
+        "version": tag.lstrip("vV"),
+        "tag": tag,
+        "url": "https://github.com/%s/releases/download/%s/%s" % (REPO, tag, ZIP_NAME),
+        "size": 0,
+        "published": "",
+    }
+
+
+def download(url: str, dest: str, on_progress=None,
+             timeout: float = DOWNLOAD_TIMEOUT, mirrors=None) -> str:
+    """下载到 `dest`，**失败了自动换镜像**。返回 dest。
+
+    ⚠️ 2026-11-09 用户问「是否有用 github 加速」—— 原来**没有**，直连。
+       本机实测 128MB 那个包：
+         · 直连 GitHub      0.23 MB/s  ≈ 9 分钟
+         · ghfast.top 镜像  0.69 MB/s  ≈ 3 分钟   ← 快 3 倍
+         · ghproxy.net      0.03 MB/s  ≈ 70 分钟（等于不可用）
+       所以默认顺序是「直连 → 镜像」，并且带**速度闸**：
+       开下 8 秒还没到 200KB/s 就掐掉换下一个（否则用户会盯着一条几乎不动的进度条）。
+    ⚠️ 镜像只是**在 URL 前面加一段前缀**（`https://ghfast.top/https://github.com/...`），
+       不改 URL 本身 —— 所以任何一个前缀都能用，用户也可以填自己的（`update.mirror`）。
+    ⚠️ 换镜像时**从头下**（不能接着下：不同镜像的分段不保证一致）。
+    """
+    order = list(mirrors) if mirrors is not None else default_mirrors()
+    if "" not in order:
+        order.insert(0, "")          # 永远先试直连（直连最快时别绕）
+    # ⚠️ 目录在这里建一次（`_download_one` 只负责写文件；测试会打桩它，
+    #    要是目录只在桩里建，桩就不需要知道这件事 —— 少一个坑）。
+    os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
+    last_err = None
+    for prefix in order:
+        target = prefix + url if prefix else url
+        try:
+            _download_one(target, dest, on_progress, timeout)
+            if prefix:
+                _log_note("下载走的镜像：%s" % prefix)
+            return dest
+        except Exception as e:
+            last_err = e
+            _log_note("这个源不行（%s），换下一个：%s"
+                      % (prefix or "直连", str(e)[:80]))
+    raise RuntimeError("所有下载源都失败：%s" % (str(last_err)[:120]))
+
+
+#: 下载时试着加在前面的**加速前缀**（`update.mirror` 填了就当第一个）。
+#:
+#: ⚠️ 这些是第三方服务，随时可能挂/变慢 —— 所以是"**依次试**"而不是"必须用"，
+#:    而且**直连永远排第一**（本机实测直连有时反而更快）。
+#: ⚠️ 2026-11-09 实测（本机、那个 128MB 的包）：ghfast.top 0.69MB/s、
+#:    ghproxy.net 0.03MB/s（不可用）。所以 ghproxy.net 放最后当兜底。
+MIRROR_PREFIXES = [
+    "https://ghfast.top/",
+    "https://gh-proxy.com/",
+    "https://ghproxy.net/",
+]
+
+
+def default_mirrors(custom: str = "") -> list:
+    """默认的镜像顺序（`custom` 非空就放最前面）。返回带前导空串（= 直连）的列表。"""
+    out = [""]
+    c = (custom or "").strip()
+    if c:
+        if not c.endswith("/"):
+            c += "/"
+        if c not in out:
+            out.append(c)
+    for p in MIRROR_PREFIXES:
+        if p not in out:
+            out.append(p)
+    return out
+
+
+def _log_note(msg: str) -> None:
+    """给更新过程的日志（没配 logger 就 print，源码版调试时看得见）。"""
+    try:
+        print("[更新] %s" % msg, flush=True)
+    except Exception:
+        pass
+
+
+def _download_one(url: str, dest: str, on_progress, timeout: float) -> None:
+    """下一个源。带**速度闸**：8 秒内没到 200KB/s 就当它不行。"""
+    import time
 
     os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
     req = urllib.request.Request(url, headers={
         "User-Agent": "wechat-ai-assistant-updater"})
+    t0 = time.monotonic()
     with urllib.request.urlopen(req, timeout=timeout) as r, open(dest, "wb") as f:
         total = int(r.headers.get("Content-Length") or 0)
         got = 0
@@ -122,9 +243,11 @@ def download(url: str, dest: str, on_progress=None,
                     on_progress(got, total)
                 except Exception:
                     pass
+            el = time.monotonic() - t0
+            if el >= STALL_AFTER_S and got / el < STALL_MIN_BYTES_PER_S:
+                raise RuntimeError("太慢（%.2f MB/s）" % (got / el / 1048576))
     if os.path.getsize(dest) < 1024:
         raise RuntimeError("下载下来的文件太小（可能被拦截了）")
-    return dest
 
 
 def extract(zip_path: str, into: str) -> str:

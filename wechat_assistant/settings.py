@@ -334,6 +334,10 @@ SPEC: List[Setting] = [
                  "正文一个字都出不来。"),
     Setting("ai.timeout", "advanced", "超时", "int", default=60, lo=5, hi=300, unit="秒",
             help="等模型回话的最长时间。网络慢或模型排队时才需要调大。"),
+    # ⚠️ 2026-11-09 用户问「是否有用 github 加速」：**下载更新**慢时可以填一个加速前缀。
+    #    留空 = 自动（直连 8 秒不够快就依次换内置镜像，见 `updater.MIRROR_PREFIXES`）。
+    Setting("update.mirror", "advanced", "更新加速地址", "text", default="",
+            help="下载更新慢时填一个加速前缀，例如 https://ghfast.top/ 。留空 = 自动换源。"),
     # ⚠️ 2026-10-13：「随机性」从常用组挪进「高级」。
     #    代码**真的在用**它（`ai.py:93` 读、`ai.py:192` 随请求发出去），不是死变量；
     #    但默认 1.0 = 模型自己的默认值，等于「没设」——

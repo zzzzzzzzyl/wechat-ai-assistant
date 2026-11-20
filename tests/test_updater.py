@@ -105,7 +105,7 @@ def test_latest_stub():
         urllib.request.urlopen = lambda req, timeout=None: Resp({
             "tag_name": "v0.2.5", "assets": []})
         try:
-            updater.latest()
+            updater._latest_api(5)
             err = ""
         except Exception as e:
             err = str(e)
@@ -116,11 +116,13 @@ def test_latest_stub():
 
         urllib.request.urlopen = boom
         try:
-            updater.latest()
+            updater._latest_api(5)
             err = ""
         except Exception as e:
             err = "%s: %s" % (type(e).__name__, e)
         check("网络失败会抛（界面据此提示连不上）", "URLError" in err, err)
+        # ⚠️ `latest()` 自己**不抛**：API 失败会退回读 releases/latest 的跳转
+        #    （见 `test_latest_redirect`），所以两条路要分开测。
     finally:
         urllib.request.urlopen = real
 
@@ -136,6 +138,104 @@ def test_install_dir():
     check("临时工作目录建得出来", os.path.isdir(updater.work_dir()))
 
 
+def test_mirrors():
+    """下载加速：直连优先、失败了换镜像（2026-11-09 用户问「是否有用 github 加速」）。
+
+    ⚠️ **不联网**：把 `_download_one` 打桩，验"依次试"的顺序和失败后的回退。
+    """
+    import tempfile
+
+    from wechat_assistant import updater
+
+    print("\n5. 下载源的顺序与回退")
+    d = updater.default_mirrors()
+    check("第一个永远是直连（空前缀）", d[0] == "", str(d))
+    check("内置镜像里有实测最快的 ghfast.top", "https://ghfast.top/" in d, str(d))
+    check("没有重复项", len(d) == len(set(d)), str(d))
+    d2 = updater.default_mirrors("https://my.proxy")
+    check("自定义前缀排第二（紧跟直连）", d2[1] == "https://my.proxy/", str(d2))
+    check("自定义前缀没写结尾斜杠也会补上", d2[1].endswith("/"), d2[1])
+
+    # 打桩：直连失败 -> 第一个镜像成功
+    tried = []
+
+    def fake_one(url, dest, on_progress, timeout):
+        tried.append(url)
+        if len(tried) == 1:
+            raise RuntimeError("太慢（0.02 MB/s）")
+        with open(dest, "wb") as f:
+            f.write(b"x" * 2048)
+
+    real = updater._download_one
+    updater._download_one = fake_one
+    try:
+        tmp = os.path.join(tempfile.gettempdir(), "wxai_upd_test", "a.zip")
+        out = updater.download("https://github.com/a/b.zip", tmp)
+        check("直连失败后自动换镜像并下载成功", os.path.isfile(out), out)
+        check("试的顺序：直连 -> 镜像",
+              tried[0] == "https://github.com/a/b.zip"
+              and tried[1] != tried[0], str(tried[:3]))
+        check("镜像是在原地址前加前缀（不改原地址）",
+              tried[1].endswith("https://github.com/a/b.zip"), tried[1])
+
+        # 全失败 -> 抛错
+        def all_fail(url, dest, on_progress, timeout):
+            raise RuntimeError("连不上")
+
+        updater._download_one = all_fail
+        try:
+            updater.download("https://github.com/a/b.zip", tmp)
+            err = ""
+        except Exception as e:
+            err = str(e)
+        check("所有源都失败时**抛错**（界面据此提示）", "所有下载源" in err, err)
+    finally:
+        updater._download_one = real
+
+
+def test_latest_redirect():
+    """API 不通时的退路：读 `releases/latest` 的跳转拿 tag（2026-11-09 加）。"""
+    import urllib.request
+
+    from wechat_assistant import updater
+
+    print("\n6. API 不通时用跳转兜底")
+    real = urllib.request.urlopen
+
+    class R:
+        def __init__(self, final):
+            self._f = final
+
+        def geturl(self):
+            return self._f
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    try:
+        urllib.request.urlopen = lambda req, timeout=None: R(
+            "https://github.com/zzzzzzzzyl/wechat-ai-assistant/releases/tag/v0.2.9")
+        info = updater._latest_redirect(5)
+        check("从跳转地址里解析出版本", info["version"] == "0.2.9", str(info))
+        check("下载地址按约定资产名拼出来",
+              info["url"].endswith("/v0.2.9/" + updater.ZIP_NAME), info["url"])
+        check("跳转拿不到 size（填 0，不影响下载）", info["size"] == 0)
+
+        urllib.request.urlopen = lambda req, timeout=None: R(
+            "https://github.com/zzzzzzzzyl/wechat-ai-assistant/releases")
+        try:
+            updater._latest_redirect(5)
+            err = ""
+        except Exception as e:
+            err = str(e)
+        check("地址不像某个 tag 时抛错（不会瞎猜）", "拿不到" in err, err)
+    finally:
+        urllib.request.urlopen = real
+
+
 def main():
     print("=" * 70)
     print("检查更新 / 自动更新测试")
@@ -144,6 +244,8 @@ def main():
     test_apply_script()
     test_latest_stub()
     test_install_dir()
+    test_mirrors()
+    test_latest_redirect()
     print("\n" + "=" * 70)
     print("通过 %d，失败 %d" % (PASS, FAIL))
     print("=" * 70)
